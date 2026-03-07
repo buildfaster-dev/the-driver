@@ -246,44 +246,42 @@ Given the 6-hour timeline, testing focuses on critical paths:
 
 ## 8. Implementation Plan
 
-### Phase 1: Skeleton (Hour 1)
-- Project setup: `uv init`, dependencies, directory structure
-- CLI with Click: `the-driver analyze` command with all options
-- `RepoData` and all dataclasses defined
-- Repo Ingester: load local repo, extract files and commits
+### Bootstrap Phases (Initial Build)
 
-### Phase 2: Layer 1 — Scanner (Hour 2)
-- Language detection
-- Test file detection and ratio calculation
-- Linter config detection
-- Commit history analysis (count, message quality)
-- Security scan (regex-based secret detection)
-- Error handling pattern detection
+#### Phase 1: Infrastructure
+- Project setup: `uv init`, `pyproject.toml`, dependencies
+- Directory structure and module scaffolding
+- CLI entry point wired with Click
+- Dataclasses/models defined (empty shells)
+- Configuration (env vars, constants)
 
-### Phase 3: Layer 2 — AI Reviewer (Hour 2-3)
-- Claude API integration with Anthropic SDK
-- System prompt with Three Pillars rubric
-- Codebase context preparation (token-aware)
-- Response parsing into `ReviewResult`
-- `--model` flag support
+#### Phase 2: Business Domain
+- Repo Ingester: Git repo → RepoData (files, commits, metadata)
+- Scanner (Layer 1): static analysis metrics (test ratio, linter, commits, security)
+- Reviewer (Layer 2): Claude API integration + Three Pillars scoring
+- Report Generator (Layer 3): Jinja2 template → report.md
+- Classification logic: scoring → label → recommendation
+- Pipeline orchestration: CLI → Ingester → Scanner + Reviewer → Report
 
-### Phase 4: Layer 3 — Report Generator (Hour 4)
-- Jinja2 report template
-- Classification logic
-- Recommendation logic
-- Markdown output with code snippets
+#### Phase 3: Testing & Calibration
+- Unit tests per module (scanner, ingester, report)
+- Integration test (mock API, end-to-end flow)
+- Calibration: run on real repos, compare with manual judgment, adjust AI prompt
 
-### Phase 5: Integration & Polish (Hour 5)
-- End-to-end pipeline wiring
-- Error handling and edge cases
-- Progress indicators with Rich
-- Help text and CLI polish
+#### Phase 4: Documentation & Distribution
+- README.md with installation and usage instructions
+- Example report output
+- `--help` text polished
+- Publishable package (`uv build`, PyPI-ready)
 
-### Phase 6: Test & Calibrate (Hour 6)
-- Run on 2-3 real repos
-- Compare output against manual assessment
-- Adjust AI prompt/rubric as needed
-- Fix bugs found during testing
+### Development Cycle (New Features & Changes)
+
+For ongoing development after the initial build:
+
+1. **Spec**: Define the change — update PRD (if new requirement) or TDD (if architectural change). Create an ADR for significant decisions.
+2. **Implement**: Write the code following existing patterns and conventions.
+3. **Test**: Add or update tests to cover the change.
+4. **Review**: Verify against acceptance criteria. Run on a real repo to validate.
 
 ### Technical Risks
 

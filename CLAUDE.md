@@ -100,9 +100,14 @@ uv run pytest                        # Run tests
 
 ## Implementation Phases
 
-1. **Skeleton** (Hour 1): Project setup, CLI, dataclasses, ingester
-2. **Scanner** (Hour 2): Layer 1 static analysis
-3. **Reviewer** (Hour 2-3): Layer 2 Claude API integration
-4. **Report** (Hour 4): Layer 3 Jinja2 template + generation
-5. **Integration** (Hour 5): Pipeline wiring, error handling, Rich progress
-6. **Calibration** (Hour 6): Test on real repos, adjust AI prompt
+### Bootstrap (Initial Build)
+1. **Infrastructure**: Project setup, dependencies, CLI entry point, dataclasses, configuration
+2. **Business Domain**: Ingester, Scanner, Reviewer, Report Generator, classification logic, pipeline orchestration
+3. **Testing & Calibration**: Unit tests, integration tests, run on real repos, adjust AI prompt
+4. **Documentation & Distribution**: README, example output, help text, publishable package
+
+### Development Cycle (New Features & Changes)
+1. **Spec**: Define the change (update PRD/TDD, create ADR if significant)
+2. **Implement**: Write code following existing patterns
+3. **Test**: Add/update tests
+4. **Review**: Verify against acceptance criteria, run on real repo
