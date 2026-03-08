@@ -20,33 +20,23 @@ uv sync
 
 ## Usage
 
-**Note:** The repo must be cloned locally first. Remote URL analysis is not yet supported.
-
 ```bash
 export ANTHROPIC_API_KEY=your-key-here
 
-# Clone the candidate's repo first
-git clone https://github.com/candidate/repo /tmp/candidate-repo
-
-# Run analysis
-uv run the-driver analyze /tmp/candidate-repo
-
-# With all options
-uv run the-driver analyze /tmp/candidate-repo \
-  --candidate "Jane Doe" \
-  --repo-url "https://github.com/candidate/repo" \
-  --output ./reports/jane-doe.md \
-  --model opus
+# Analyze a local repo
+uv run the-driver analyze /path/to/candidate/repo
 ```
 
 ### Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--candidate` | Not specified | Candidate name for report header |
-| `--repo-url` | Local path | URL for report header (metadata only, does not clone) |
+| `--model` | `sonnet` | Claude model: `sonnet` (faster, cheaper) or `opus` (deeper analysis) |
 | `--output` | `./report.md` | Output file path |
-| `--model` | `sonnet` | Claude model: `sonnet`, `opus`, or `haiku` |
+| `--candidate` | Not specified | Candidate name for report header |
+| `--repo-url` | — | Repository URL for report header |
+
+`--candidate` and `--repo-url` are metadata that appear in the report header. They do not affect analysis.
 
 ## How It Works
 
