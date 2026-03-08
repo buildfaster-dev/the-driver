@@ -1,5 +1,6 @@
 import os
-from git import Repo
+import click
+from git import Repo, InvalidGitRepositoryError, NoSuchPathError
 from vetter.models import RepoData, FileInfo, CommitInfo
 
 
@@ -54,6 +55,7 @@ TEST_PATTERNS = [
 ]
 
 MAX_FILE_SIZE = 100 * 1024  # 100KB
+MAX_COMMITS = 500
 
 
 def _detect_language(path: str) -> str:
@@ -77,7 +79,12 @@ def _is_binary(path: str) -> bool:
 
 
 def ingest_repo(repo_path: str) -> RepoData:
-    repo = Repo(repo_path)
+    try:
+        repo = Repo(repo_path)
+    except InvalidGitRepositoryError:
+        raise click.ClickException(f"Not a Git repository: {repo_path}")
+    except NoSuchPathError:
+        raise click.ClickException(f"Path does not exist: {repo_path}")
 
     files: list[FileInfo] = []
     languages: dict[str, int] = {}
@@ -119,7 +126,7 @@ def ingest_repo(repo_path: str) -> RepoData:
             ))
 
     commits: list[CommitInfo] = []
-    for commit in repo.iter_commits():
+    for commit in repo.iter_commits(max_count=MAX_COMMITS):
         stats = commit.stats.total
         commits.append(CommitInfo(
             hash=commit.hexsha[:8],

@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import click
 import anthropic
 from vetter.models import RepoData, ReviewResult, PillarScore
@@ -109,6 +110,12 @@ def _build_codebase_context(repo_data: RepoData) -> str:
     return "\n".join(parts)
 
 
+def _clamp_score(value) -> int:
+    """Ensure score is an integer in 1-5 range."""
+    score = int(round(value))
+    return max(1, min(5, score))
+
+
 def _parse_review_response(response_text: str) -> ReviewResult:
     text = response_text.strip()
     if text.startswith("```"):
@@ -128,19 +135,19 @@ def _parse_review_response(response_text: str) -> ReviewResult:
         return ReviewResult(
             architecture_awareness=PillarScore(
                 name="Architecture Awareness",
-                score=data["architecture_awareness"]["score"],
+                score=_clamp_score(data["architecture_awareness"]["score"]),
                 justification=data["architecture_awareness"]["justification"],
                 evidence=data["architecture_awareness"].get("evidence", []),
             ),
             code_refinement=PillarScore(
                 name="Code Refinement",
-                score=data["code_refinement"]["score"],
+                score=_clamp_score(data["code_refinement"]["score"]),
                 justification=data["code_refinement"]["justification"],
                 evidence=data["code_refinement"].get("evidence", []),
             ),
             edge_case_coverage=PillarScore(
                 name="Edge Case Coverage",
-                score=data["edge_case_coverage"]["score"],
+                score=_clamp_score(data["edge_case_coverage"]["score"]),
                 justification=data["edge_case_coverage"]["justification"],
                 evidence=data["edge_case_coverage"].get("evidence", []),
             ),
@@ -162,22 +169,28 @@ def review_repo(repo_data: RepoData, model: str = "sonnet") -> ReviewResult:
     client = anthropic.Anthropic(api_key=api_key)
     context = _build_codebase_context(repo_data)
 
-    try:
-        message = client.messages.create(
-            model=model_id,
-            max_tokens=4096,
-            temperature=0,
-            system=SYSTEM_PROMPT,
-            messages=[
-                {"role": "user", "content": f"Review this candidate's technical test submission:\n\n{context}"}
-            ],
-        )
-    except anthropic.AuthenticationError:
-        raise click.ClickException("Invalid ANTHROPIC_API_KEY. Please check your API key.")
-    except anthropic.RateLimitError:
-        raise click.ClickException("Anthropic API rate limit reached. Please wait and try again.")
-    except anthropic.APIError as e:
-        raise click.ClickException(f"Anthropic API error: {e}")
+    max_attempts = 2
+    for attempt in range(max_attempts):
+        try:
+            message = client.messages.create(
+                model=model_id,
+                max_tokens=4096,
+                temperature=0,
+                system=SYSTEM_PROMPT,
+                messages=[
+                    {"role": "user", "content": f"Review this candidate's technical test submission:\n\n{context}"}
+                ],
+            )
+            break
+        except anthropic.AuthenticationError:
+            raise click.ClickException("Invalid ANTHROPIC_API_KEY. Please check your API key.")
+        except anthropic.RateLimitError:
+            if attempt < max_attempts - 1:
+                time.sleep(5)
+                continue
+            raise click.ClickException("Anthropic API rate limit reached. Please wait and try again.")
+        except anthropic.APIError as e:
+            raise click.ClickException(f"Anthropic API error: {e}")
 
     response_text = message.content[0].text
     return _parse_review_response(response_text)

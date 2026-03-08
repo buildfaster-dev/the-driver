@@ -3,7 +3,7 @@ import pytest
 import click
 from unittest.mock import patch, MagicMock
 from vetter.models import RepoData, FileInfo
-from vetter.reviewer import review_repo, _parse_review_response, _build_codebase_context
+from vetter.reviewer import review_repo, _parse_review_response, _build_codebase_context, _clamp_score
 
 
 VALID_RESPONSE = json.dumps({
@@ -93,3 +93,40 @@ class TestReviewRepo:
         assert result.architecture_awareness.score == 4
         assert result.code_refinement.score == 3
         assert result.edge_case_coverage.score == 2
+
+
+class TestClampScore:
+    def test_valid_score_unchanged(self):
+        assert _clamp_score(3) == 3
+
+    def test_zero_clamped_to_1(self):
+        assert _clamp_score(0) == 1
+
+    def test_negative_clamped_to_1(self):
+        assert _clamp_score(-2) == 1
+
+    def test_six_clamped_to_5(self):
+        assert _clamp_score(6) == 5
+
+    def test_ten_clamped_to_5(self):
+        assert _clamp_score(10) == 5
+
+    def test_float_rounded(self):
+        assert _clamp_score(3.7) == 4
+
+    def test_float_rounded_down(self):
+        assert _clamp_score(2.3) == 2
+
+
+class TestParseResponseScoreClamping:
+    def test_out_of_range_scores_clamped(self):
+        response = json.dumps({
+            "architecture_awareness": {"score": 0, "justification": "test", "evidence": []},
+            "code_refinement": {"score": 10, "justification": "test", "evidence": []},
+            "edge_case_coverage": {"score": 3.7, "justification": "test", "evidence": []},
+            "overall_summary": "test",
+        })
+        result = _parse_review_response(response)
+        assert result.architecture_awareness.score == 1
+        assert result.code_refinement.score == 5
+        assert result.edge_case_coverage.score == 4
