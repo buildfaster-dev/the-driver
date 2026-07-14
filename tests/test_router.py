@@ -4,12 +4,16 @@ from unittest.mock import MagicMock, patch
 import anthropic
 import click
 import httpx
+import openai
 import pytest
 
+from vetter.models import FileInfo, RepoData
+from vetter.reviewer import review_repo
 from vetter.router import (
     MAX_ATTEMPTS,
     AnthropicProvider,
     FatalProviderError,
+    OpenAIProvider,
     ProviderResponse,
     TransientProviderError,
     _call_with_retry,
@@ -213,11 +217,253 @@ class TestComplete:
 
     @patch("vetter.router.time.sleep")
     @patch("vetter.router.anthropic.Anthropic")
-    def test_exhausted_transient_raises_click_exception(self, mock_class, mock_sleep):
+    def test_exhausted_transient_without_fallback_key_raises(self, mock_class, mock_sleep, monkeypatch):
         mock_class.return_value = _make_client_raising(
             _status_error(anthropic.RateLimitError, 429)
         )
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-            with pytest.raises(click.ClickException, match="unavailable after"):
+            with pytest.raises(click.ClickException, match="fallback is not available"):
                 complete("system", "user")
         assert mock_class.return_value.messages.create.call_count == MAX_ATTEMPTS
+
+
+def _openai_status_error(cls, status_code):
+    request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    response = httpx.Response(status_code, request=request)
+    return cls("boom", response=response, body=None)
+
+
+def _openai_client_returning(text, prompt_tokens=80, completion_tokens=20):
+    client = MagicMock()
+    completion = MagicMock()
+    choice = MagicMock()
+    choice.message.content = text
+    completion.choices = [choice]
+    completion.usage.prompt_tokens = prompt_tokens
+    completion.usage.completion_tokens = completion_tokens
+    client.chat.completions.create.return_value = completion
+    return client
+
+
+BOTH_KEYS = {"ANTHROPIC_API_KEY": "test-key-a", "OPENAI_API_KEY": "test-key-o"}
+
+
+class TestOpenAIProviderErrorTranslation:
+    """Inject real openai SDK exception classes; assert the router-level category."""
+
+    def _provider_with(self, exc):
+        client = MagicMock()
+        client.chat.completions.create.side_effect = exc
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}):
+            with patch("vetter.router.openai.OpenAI") as mock_class:
+                mock_class.return_value = client
+                provider = OpenAIProvider()
+        return provider
+
+    @pytest.mark.parametrize("exc_class,status", [
+        (openai.RateLimitError, 429),
+        (openai.InternalServerError, 500),
+        (openai.InternalServerError, 503),
+    ])
+    def test_transient_status_errors(self, exc_class, status):
+        provider = self._provider_with(_openai_status_error(exc_class, status))
+        with pytest.raises(TransientProviderError):
+            provider.complete(**CALL_ARGS)
+
+    def test_timeout_is_transient(self):
+        request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+        provider = self._provider_with(openai.APITimeoutError(request=request))
+        with pytest.raises(TransientProviderError):
+            provider.complete(**CALL_ARGS)
+
+    @pytest.mark.parametrize("exc_class,status", [
+        (openai.AuthenticationError, 401),
+        (openai.PermissionDeniedError, 403),
+        (openai.NotFoundError, 404),
+        (openai.BadRequestError, 400),
+    ])
+    def test_fatal_status_errors(self, exc_class, status):
+        provider = self._provider_with(_openai_status_error(exc_class, status))
+        with pytest.raises(FatalProviderError):
+            provider.complete(**CALL_ARGS)
+
+    def test_missing_api_key_is_fatal(self):
+        with patch.dict("os.environ", {}, clear=True):
+            with pytest.raises(FatalProviderError, match="OPENAI_API_KEY"):
+                OpenAIProvider()
+
+
+class TestOpenAIProviderRequestShape:
+    @patch("vetter.router.openai.OpenAI")
+    def test_normalizes_response_and_request(self, mock_class):
+        mock_class.return_value = _openai_client_returning("hello", 80, 20)
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}):
+            provider = OpenAIProvider()
+        response = provider.complete("sys", "usr", "gpt-5.6-terra", 4096, 0.0)
+
+        assert response == ProviderResponse(text="hello", input_tokens=80, output_tokens=20)
+
+        kwargs = mock_class.return_value.chat.completions.create.call_args.kwargs
+        assert kwargs["model"] == "gpt-5.6-terra"
+        assert kwargs["max_completion_tokens"] == 4096
+        assert "temperature" not in kwargs  # reasoning models 400 on non-default sampling
+        assert kwargs["messages"][0] == {"role": "system", "content": "sys"}
+        assert kwargs["messages"][1] == {"role": "user", "content": "usr"}
+
+
+class TestFallbackLadder:
+    """Eval 1: effects on both SDK mocks, never the router's own announcements."""
+
+    @patch("vetter.router.time.sleep")
+    @patch("vetter.router.openai.OpenAI")
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_transient_primary_falls_back_to_openai(
+        self, mock_anthropic, mock_openai, mock_sleep, capsys
+    ):
+        mock_anthropic.return_value = _make_client_raising(
+            _status_error(anthropic.RateLimitError, 429)
+        )
+        mock_openai.return_value = _openai_client_returning("openai says hi")
+
+        with patch.dict("os.environ", BOTH_KEYS):
+            text = complete("system", "user", model="sonnet")
+
+        assert text == "openai says hi"
+        # Primary confirmed called and failed; secondary confirmed called and answered
+        assert mock_anthropic.return_value.messages.create.call_count == MAX_ATTEMPTS
+        assert mock_openai.return_value.chat.completions.create.call_count == 1
+
+        # Ajuste 4: who answered is visible on stderr, not only in the log
+        err = capsys.readouterr().err
+        assert "falling back to openai (gpt-5.6-terra)" in err
+        assert "produced by openai (gpt-5.6-terra)" in err
+
+    @patch("vetter.router.openai.OpenAI")
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_auth_error_fails_fast_without_fallback(self, mock_anthropic, mock_openai):
+        mock_anthropic.return_value = _make_client_raising(
+            _status_error(anthropic.AuthenticationError, 401)
+        )
+        with patch.dict("os.environ", BOTH_KEYS):
+            with pytest.raises(click.ClickException, match="ANTHROPIC_API_KEY"):
+                complete("system", "user")
+
+        assert mock_anthropic.return_value.messages.create.call_count == 1
+        mock_openai.assert_not_called()
+
+    @patch("vetter.router.time.sleep")
+    @patch("vetter.router.openai.OpenAI")
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_both_providers_down(self, mock_anthropic, mock_openai, mock_sleep):
+        mock_anthropic.return_value = _make_client_raising(
+            _status_error(anthropic.InternalServerError, 529)
+        )
+        openai_client = MagicMock()
+        openai_client.chat.completions.create.side_effect = _openai_status_error(
+            openai.InternalServerError, 500
+        )
+        mock_openai.return_value = openai_client
+
+        with patch.dict("os.environ", BOTH_KEYS):
+            with pytest.raises(click.ClickException, match="Both providers failed"):
+                complete("system", "user")
+
+        assert mock_anthropic.return_value.messages.create.call_count == MAX_ATTEMPTS
+        assert openai_client.chat.completions.create.call_count == MAX_ATTEMPTS
+
+    @patch("vetter.router.time.sleep")
+    @patch("vetter.router.openai.OpenAI")
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_fatal_on_fallback_fails_fast(self, mock_anthropic, mock_openai, mock_sleep):
+        mock_anthropic.return_value = _make_client_raising(
+            _status_error(anthropic.RateLimitError, 429)
+        )
+        openai_client = MagicMock()
+        openai_client.chat.completions.create.side_effect = _openai_status_error(
+            openai.AuthenticationError, 401
+        )
+        mock_openai.return_value = openai_client
+
+        with patch.dict("os.environ", BOTH_KEYS):
+            with pytest.raises(click.ClickException, match="Both providers failed"):
+                complete("system", "user")
+
+        # Fatal on the fallback rung: one call, no retries there
+        assert openai_client.chat.completions.create.call_count == 1
+
+
+class TestCallLogFallbackCross:
+    """Ajuste 2: the JSONL testimony must match the mocks' independent evidence."""
+
+    @patch("vetter.router.time.sleep")
+    @patch("vetter.router.openai.OpenAI")
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_log_matches_mock_effects(
+        self, mock_anthropic, mock_openai, mock_sleep, isolated_call_log
+    ):
+        mock_anthropic.return_value = _make_client_raising(
+            _status_error(anthropic.RateLimitError, 429)
+        )
+        mock_openai.return_value = _openai_client_returning("ok", 80, 20)
+
+        with patch.dict("os.environ", BOTH_KEYS):
+            complete("system", "user", model="sonnet")
+
+        records = _read_log(isolated_call_log)
+        anthropic_records = [r for r in records if r["provider"] == "anthropic"]
+        openai_records = [r for r in records if r["provider"] == "openai"]
+
+        # Log claims N failed anthropic attempts → the mock must confirm exactly N calls
+        assert len(anthropic_records) == mock_anthropic.return_value.messages.create.call_count == MAX_ATTEMPTS
+        assert all(r["outcome"] == "error:transient" for r in anthropic_records)
+        assert all(r["model"] == "claude-sonnet-4-6" for r in anthropic_records)
+
+        # Log claims one openai answer → the mock must confirm exactly one call
+        assert len(openai_records) == mock_openai.return_value.chat.completions.create.call_count == 1
+        assert openai_records[0]["outcome"] == "fallback_success"
+        assert openai_records[0]["model"] == "gpt-5.6-terra"
+        assert openai_records[0]["input_tokens"] == 80
+        assert openai_records[0]["output_tokens"] == 20
+        # 80*$2.50 + 20*$15.00 per MTok
+        assert openai_records[0]["cost_usd"] == pytest.approx(0.0005)
+
+
+REVIEW_JSON = json.dumps({
+    "architecture_awareness": {
+        "score": 4, "justification": "Solid layout.", "evidence": ["app.py:1 — layering"],
+    },
+    "code_refinement": {
+        "score": 3, "justification": "Readable.", "evidence": ["app.py:5 — idioms"],
+    },
+    "edge_case_coverage": {
+        "score": 2, "justification": "Few tests.", "evidence": ["tests/ — sparse"],
+    },
+    "overall_summary": "Acceptable submission.",
+})
+
+
+class TestPipelineFallback:
+    """Eval 1 end-to-end: primary down (simulated) → fallback yields a valid ReviewResult."""
+
+    @patch("vetter.router.time.sleep")
+    @patch("vetter.router.openai.OpenAI")
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_review_repo_survives_primary_outage(self, mock_anthropic, mock_openai, mock_sleep):
+        mock_anthropic.return_value = _make_client_raising(
+            _status_error(anthropic.RateLimitError, 429)
+        )
+        mock_openai.return_value = _openai_client_returning(REVIEW_JSON)
+        repo = RepoData(
+            path="/fake/repo",
+            files=[FileInfo("app.py", "print('hi')", "Python", 11, False)],
+            commits=[], languages={"Python": 1}, total_files=1, total_lines=1,
+        )
+
+        with patch.dict("os.environ", BOTH_KEYS):
+            result = review_repo(repo, model="sonnet")
+
+        assert result.architecture_awareness.score == 4
+        assert result.edge_case_coverage.score == 2
+        assert mock_anthropic.return_value.messages.create.call_count == MAX_ATTEMPTS
+        assert mock_openai.return_value.chat.completions.create.call_count == 1

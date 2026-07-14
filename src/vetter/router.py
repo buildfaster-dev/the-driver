@@ -26,6 +26,7 @@ from typing import Protocol
 
 import anthropic
 import click
+import openai
 
 
 class TransientProviderError(Exception):
@@ -36,13 +37,17 @@ class FatalProviderError(Exception):
     """Non-retryable provider failure: credentials, permissions, bad request."""
 
 
-# Model alias → per-provider model id. A raw model id (not an alias) is passed
-# through to the provider unchanged.
+# Model alias → per-provider model id, matched by tier (balanced/top/cheap).
 MODEL_MAP = {
-    "sonnet": {"anthropic": "claude-sonnet-4-6"},
-    "opus": {"anthropic": "claude-opus-4-6"},
-    "haiku": {"anthropic": "claude-haiku-4-5-20251001"},
+    "sonnet": {"anthropic": "claude-sonnet-4-6", "openai": "gpt-5.6-terra"},
+    "opus": {"anthropic": "claude-opus-4-6", "openai": "gpt-5.6-sol"},
+    "haiku": {"anthropic": "claude-haiku-4-5-20251001", "openai": "gpt-5.6-luna"},
 }
+
+# When the user passes a raw model id instead of an alias, it goes to the
+# primary provider unchanged; a fallback provider can't use it and gets its
+# default model instead.
+DEFAULT_MODELS = {"openai": "gpt-5.6-terra"}
 
 # USD per million tokens (input, output). Checked against provider pricing
 # docs on 2026-07-12. Unknown models log cost_usd as null rather than a guess.
@@ -50,6 +55,9 @@ PRICING = {
     "claude-sonnet-4-6": (3.00, 15.00),
     "claude-opus-4-6": (5.00, 25.00),
     "claude-haiku-4-5-20251001": (1.00, 5.00),
+    "gpt-5.6-terra": (2.50, 15.00),
+    "gpt-5.6-sol": (5.00, 30.00),
+    "gpt-5.6-luna": (1.00, 6.00),
 }
 
 MAX_ATTEMPTS = 3
@@ -133,6 +141,59 @@ class AnthropicProvider:
         )
 
 
+class OpenAIProvider:
+    name = "openai"
+
+    def __init__(self) -> None:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise FatalProviderError("OPENAI_API_KEY environment variable is not set.")
+        self._client = openai.OpenAI(api_key=api_key)
+
+    def complete(
+        self, system: str, user_content: str, model_id: str, max_tokens: int, temperature: float
+    ) -> ProviderResponse:
+        # temperature is intentionally not sent: OpenAI reasoning models (gpt-5.x)
+        # reject non-default sampling params with a 400, which would turn a
+        # working fallback into a fatal error.
+        try:
+            completion = self._client.chat.completions.create(
+                model=model_id,
+                max_completion_tokens=max_tokens,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_content},
+                ],
+            )
+        except openai.AuthenticationError:
+            raise FatalProviderError("openai: invalid OPENAI_API_KEY. Please check your API key.")
+        except openai.PermissionDeniedError as e:
+            raise FatalProviderError(f"openai: permission denied: {e}")
+        except openai.NotFoundError as e:
+            raise FatalProviderError(f"openai: model or endpoint not found: {e}")
+        except openai.BadRequestError as e:
+            raise FatalProviderError(f"openai: bad request: {e}")
+        except (openai.RateLimitError, openai.InternalServerError) as e:
+            raise TransientProviderError(f"openai: {e}")
+        except openai.APIStatusError as e:
+            if e.status_code >= 500:
+                raise TransientProviderError(f"openai: {e}")
+            raise FatalProviderError(f"openai: {e}")
+        except openai.APIConnectionError as e:  # includes APITimeoutError
+            raise TransientProviderError(f"openai: {e}")
+        return ProviderResponse(
+            text=completion.choices[0].message.content or "",
+            input_tokens=completion.usage.prompt_tokens,
+            output_tokens=completion.usage.completion_tokens,
+        )
+
+
+def _resolve_model(model: str, provider_name: str) -> str:
+    if model in MODEL_MAP:
+        return MODEL_MAP[model][provider_name]
+    return DEFAULT_MODELS.get(provider_name, model)
+
+
 def _log_path() -> Path:
     log_dir = os.environ.get("VETTER_LOG_DIR")
     base = Path(log_dir) if log_dir else Path.home() / ".vetter"
@@ -180,7 +241,13 @@ def _record(
 
 
 def _call_with_retry(
-    provider: Provider, system: str, user_content: str, model_id: str, max_tokens: int, temperature: float
+    provider: Provider,
+    system: str,
+    user_content: str,
+    model_id: str,
+    max_tokens: int,
+    temperature: float,
+    success_outcome: str = "success",
 ) -> ProviderResponse:
     for attempt in range(MAX_ATTEMPTS):
         started = time.monotonic()
@@ -195,7 +262,7 @@ def _call_with_retry(
         except FatalProviderError as e:
             _record(provider, model_id, started, "error:fatal", error=e)
             raise
-        _record(provider, model_id, started, "success", response=response)
+        _record(provider, model_id, started, success_outcome, response=response)
         return response
     raise AssertionError("unreachable")
 
@@ -207,19 +274,55 @@ def complete(
     max_tokens: int = 4096,
     temperature: float = 0.0,
 ) -> str:
-    """Route a completion request to a provider and return the response text.
+    """Route a completion request through the resilience ladder and return the text.
 
-    Callers stay ignorant of which provider SDK answered; failures surface as
-    click.ClickException with the provider named in the message.
+    Ladder: primary (anthropic) with retry+backoff on transient errors; if it
+    stays down, fall back to openai; fatal errors fail fast at any rung. When
+    the fallback answers, a notice goes to stderr so "who answered" never
+    requires opening the call log. Callers stay ignorant of which provider SDK
+    answered; failures surface as click.ClickException.
     """
     try:
-        provider = AnthropicProvider()
-        model_id = MODEL_MAP.get(model, {}).get(provider.name, model)
-        response = _call_with_retry(provider, system, user_content, model_id, max_tokens, temperature)
+        primary = AnthropicProvider()
+    except FatalProviderError as e:
+        raise click.ClickException(str(e))
+    primary_model = _resolve_model(model, primary.name)
+
+    try:
+        return _call_with_retry(primary, system, user_content, primary_model, max_tokens, temperature).text
     except FatalProviderError as e:
         raise click.ClickException(str(e))
     except TransientProviderError as e:
+        primary_error = e
+
+    # Primary exhausted its retries on transient errors only — climb the ladder.
+    try:
+        fallback = OpenAIProvider()
+    except FatalProviderError as e:
         raise click.ClickException(
-            f"anthropic unavailable after {MAX_ATTEMPTS} attempts: {e}"
+            f"anthropic ({primary_model}) unavailable after {MAX_ATTEMPTS} attempts "
+            f"({primary_error}) and fallback is not available: {e}"
         )
+    fallback_model = _resolve_model(model, fallback.name)
+    click.echo(
+        f"Warning: anthropic ({primary_model}) unavailable after {MAX_ATTEMPTS} attempts; "
+        f"falling back to openai ({fallback_model}).",
+        err=True,
+    )
+    try:
+        response = _call_with_retry(
+            fallback, system, user_content, fallback_model, max_tokens, temperature,
+            success_outcome="fallback_success",
+        )
+    except (TransientProviderError, FatalProviderError) as fallback_error:
+        raise click.ClickException(
+            "Both providers failed. "
+            f"anthropic ({primary_model}): {primary_error} | "
+            f"openai ({fallback_model}): {fallback_error}"
+        )
+    click.echo(
+        f"Note: this review was produced by openai ({fallback_model}), "
+        f"not the requested anthropic model ({primary_model}).",
+        err=True,
+    )
     return response.text
