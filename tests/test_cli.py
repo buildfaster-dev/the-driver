@@ -96,3 +96,7 @@ class TestCLISuccess:
                 report = f.read()
             assert "Test Candidate" in report
             assert "Architecture Awareness" in report
+            # Eval 2 (phase 07): the per-stage trace is reported at the end
+            assert "Trace:" in result.output
+            for stage in ("ingest", "scan", "review", "gate", "report"):
+                assert f"{stage} " in result.output.split("Trace:")[1]

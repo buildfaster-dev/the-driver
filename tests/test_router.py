@@ -193,9 +193,15 @@ class TestComplete:
         mock_client = MagicMock()
         mock_class.return_value = mock_client
         mock_message = MagicMock()
-        mock_message.content = [MagicMock(text="the review")]
+        text_block = MagicMock()
+        text_block.type = "text"
+        text_block.text = "the review"
+        mock_message.stop_reason = "end_turn"
+        mock_message.content = [text_block]
         mock_message.usage.input_tokens = 50
         mock_message.usage.output_tokens = 10
+        mock_message.usage.cache_read_input_tokens = 0
+        mock_message.usage.cache_creation_input_tokens = 0
         mock_client.messages.create.return_value = mock_message
 
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
@@ -489,6 +495,8 @@ def _tool_use_message(name="get_scan_summary", tool_id="tu_1", tool_input=None):
     msg.content = [block]
     msg.usage.input_tokens = 100
     msg.usage.output_tokens = 20
+    msg.usage.cache_read_input_tokens = 0
+    msg.usage.cache_creation_input_tokens = 0
     return msg
 
 
@@ -501,6 +509,8 @@ def _text_message(text):
     msg.content = [block]
     msg.usage.input_tokens = 100
     msg.usage.output_tokens = 30
+    msg.usage.cache_read_input_tokens = 0
+    msg.usage.cache_creation_input_tokens = 0
     return msg
 
 
@@ -611,3 +621,224 @@ class TestToolExchange:
         assert len(records) == mock_client.messages.create.call_count == 2
         assert all(r["outcome"] == "success" for r in records)
         assert all(r["provider"] == "anthropic" for r in records)
+
+
+from vetter.router import (  # noqa: E402
+    CACHE_READ_MULTIPLIER,
+    CACHE_WRITE_MULTIPLIER,
+    MIN_CACHEABLE_TOKENS,
+    _cost_usd,
+)
+
+LARGE_CONTENT = "x" * (MIN_CACHEABLE_TOKENS * 3 + 100)  # above the marking threshold
+LARGE_SYSTEM = "s" * (MIN_CACHEABLE_TOKENS * 3 + 100)
+
+
+class TestPromptCacheMarking:
+    """Effects: the cache_control kwarg travels (or not) in the real SDK call."""
+
+    def _client_with_response(self):
+        client = MagicMock()
+        client.messages.create.return_value = _text_message("ok")
+        return client
+
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_large_user_content_is_marked_without_changing_bytes(self, mock_class):
+        mock_class.return_value = self._client_with_response()
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            complete("small system", LARGE_CONTENT)
+
+        kwargs = mock_class.return_value.messages.create.call_args.kwargs
+        first = kwargs["messages"][0]
+        assert first["role"] == "user"
+        assert first["content"] == [{
+            "type": "text",
+            "text": LARGE_CONTENT,  # byte-identical, only wrapped
+            "cache_control": {"type": "ephemeral"},
+        }]
+        # small system stays a plain string
+        assert kwargs["system"] == "small system"
+
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_large_system_is_marked_too(self, mock_class):
+        mock_class.return_value = self._client_with_response()
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            complete(LARGE_SYSTEM, "small question")
+
+        kwargs = mock_class.return_value.messages.create.call_args.kwargs
+        assert kwargs["system"] == [{
+            "type": "text",
+            "text": LARGE_SYSTEM,
+            "cache_control": {"type": "ephemeral"},
+        }]
+        # small user content stays a plain string
+        assert kwargs["messages"][0]["content"] == "small question"
+
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_small_prompts_are_not_marked(self, mock_class):
+        mock_class.return_value = self._client_with_response()
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            complete("small system", "small question")
+
+        kwargs = mock_class.return_value.messages.create.call_args.kwargs
+        assert kwargs["system"] == "small system"
+        assert kwargs["messages"][0]["content"] == "small question"
+
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_tool_loop_marks_first_user_message_on_every_turn(self, mock_class):
+        mock_client = MagicMock()
+        mock_class.return_value = mock_client
+        mock_client.messages.create.side_effect = [
+            _tool_use_message(tool_id="tu_1"),
+            _text_message("done"),
+        ]
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            complete_with_tools("sys", LARGE_CONTENT, [SCAN_TOOL], MagicMock(return_value="{}"))
+
+        for call in mock_client.messages.create.call_args_list:
+            first = call.kwargs["messages"][0]
+            assert first["content"][0]["cache_control"] == {"type": "ephemeral"}
+            assert first["content"][0]["text"] == LARGE_CONTENT
+        # turn 2: assistant/tool_result blocks are NOT cache-marked
+        second_turn = mock_client.messages.create.call_args_list[1].kwargs["messages"]
+        tool_result = second_turn[2]["content"][0]
+        assert "cache_control" not in tool_result
+
+    @patch("vetter.router.time.sleep")
+    @patch("vetter.router.openai.OpenAI")
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_cache_marking_never_travels_to_openai_fallback(
+        self, mock_anthropic, mock_openai, mock_sleep
+    ):
+        mock_anthropic.return_value = _make_client_raising(
+            _status_error(anthropic.RateLimitError, 429)
+        )
+        mock_openai.return_value = _openai_client_returning("fallback answer")
+
+        with patch.dict("os.environ", BOTH_KEYS):
+            complete(LARGE_SYSTEM, LARGE_CONTENT)
+
+        kwargs = mock_openai.return_value.chat.completions.create.call_args.kwargs
+        for message in kwargs["messages"]:
+            assert isinstance(message["content"], str)  # plain strings, no blocks
+        assert "cache_control" not in json.dumps(kwargs["messages"])
+        assert "system" not in kwargs  # OpenAI wire shape untouched
+
+
+class TestCacheAccounting:
+    def test_cost_formula_write_and_read_rates(self):
+        # sonnet: $3/MTok input. 500 uncached + 150k written + 100 out at $15.
+        cost = _cost_usd("claude-sonnet-4-6", 500, 100, cache_read_tokens=0, cache_write_tokens=150_000)
+        expected = (500 * 3 + 150_000 * 3 * CACHE_WRITE_MULTIPLIER + 100 * 15) / 1_000_000
+        assert cost == pytest.approx(expected)  # 0.565500
+
+        cost = _cost_usd("claude-sonnet-4-6", 500, 100, cache_read_tokens=150_000, cache_write_tokens=0)
+        expected = (500 * 3 + 150_000 * 3 * CACHE_READ_MULTIPLIER + 100 * 15) / 1_000_000
+        assert cost == pytest.approx(expected)  # 0.048000
+
+    def test_none_cache_fields_cost_like_before(self):
+        assert _cost_usd("claude-sonnet-4-6", 1000, 200) == pytest.approx(0.006)
+
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_record_carries_cache_fields_from_usage(self, mock_class, isolated_call_log):
+        mock_client = MagicMock()
+        mock_class.return_value = mock_client
+        msg = _text_message("ok")
+        msg.usage.input_tokens = 500
+        msg.usage.output_tokens = 100
+        msg.usage.cache_creation_input_tokens = 150_000
+        msg.usage.cache_read_input_tokens = 0
+        mock_client.messages.create.return_value = msg
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            complete("sys", LARGE_CONTENT, model="sonnet")
+
+        records = _read_log(isolated_call_log)
+        assert mock_client.messages.create.call_count == len(records) == 1
+        record = records[0]
+        # Cache write without read stays visible — that's the cold-run receipt
+        assert record["cache_write_tokens"] == 150_000
+        assert record["cache_read_tokens"] == 0
+        assert record["cost_usd"] == pytest.approx(0.5655)
+
+    @patch("vetter.router.time.sleep")
+    @patch("vetter.router.openai.OpenAI")
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_openai_record_has_null_cache_fields(
+        self, mock_anthropic, mock_openai, mock_sleep, isolated_call_log
+    ):
+        mock_anthropic.return_value = _make_client_raising(
+            _status_error(anthropic.RateLimitError, 429)
+        )
+        mock_openai.return_value = _openai_client_returning("ok")
+
+        with patch.dict("os.environ", BOTH_KEYS):
+            complete("sys", "user", model="sonnet")
+
+        records = _read_log(isolated_call_log)
+        openai_records = [r for r in records if r["provider"] == "openai"]
+        assert len(openai_records) == mock_openai.return_value.chat.completions.create.call_count == 1
+        # null = not measured; distinct from a measured zero
+        assert openai_records[0]["cache_read_tokens"] is None
+        assert openai_records[0]["cache_write_tokens"] is None
+
+
+class TestPricingFreshness:
+    """Eval 3 (phase 07): stale pricing warns loudly, never crashes."""
+
+    def _reset_flag(self, monkeypatch):
+        monkeypatch.setattr("vetter.router._pricing_warning_emitted", False)
+
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_expired_date_warns_and_run_continues(self, mock_class, monkeypatch, capsys):
+        from datetime import date, timedelta
+        self._reset_flag(monkeypatch)
+        monkeypatch.setattr(
+            "vetter.router.PRICING_VERIFIED_ON", date.today() - timedelta(days=120)
+        )
+        mock_client = MagicMock()
+        mock_class.return_value = mock_client
+        mock_client.messages.create.return_value = _text_message("still works")
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            text = complete("sys", "user")
+
+        assert text == "still works"  # the run continued
+        err = capsys.readouterr().err
+        assert "PRICING table last verified 120 days ago" in err
+        assert "re-verify" in err
+
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_warning_emitted_once_per_process(self, mock_class, monkeypatch, capsys):
+        from datetime import date, timedelta
+        self._reset_flag(monkeypatch)
+        monkeypatch.setattr(
+            "vetter.router.PRICING_VERIFIED_ON", date.today() - timedelta(days=120)
+        )
+        mock_client = MagicMock()
+        mock_class.return_value = mock_client
+        mock_client.messages.create.return_value = _text_message("ok")
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            complete("sys", "user")
+            complete("sys", "user")
+
+        assert capsys.readouterr().err.count("PRICING table") == 1
+
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_fresh_date_stays_silent(self, mock_class, monkeypatch, capsys):
+        from datetime import date
+        self._reset_flag(monkeypatch)
+        monkeypatch.setattr("vetter.router.PRICING_VERIFIED_ON", date.today())
+        mock_client = MagicMock()
+        mock_class.return_value = mock_client
+        mock_client.messages.create.return_value = _text_message("ok")
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            complete("sys", "user")
+
+        assert "PRICING table" not in capsys.readouterr().err

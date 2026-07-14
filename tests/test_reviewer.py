@@ -218,6 +218,8 @@ def _final_review_message(text=VALID_RESPONSE):
     msg.content = [block]
     msg.usage.input_tokens = 1000
     msg.usage.output_tokens = 200
+    msg.usage.cache_read_input_tokens = 0
+    msg.usage.cache_creation_input_tokens = 0
     return msg
 
 
@@ -232,6 +234,8 @@ def _tool_call_message(name, tool_id="tu_1"):
     msg.content = [block]
     msg.usage.input_tokens = 1000
     msg.usage.output_tokens = 50
+    msg.usage.cache_read_input_tokens = 0
+    msg.usage.cache_creation_input_tokens = 0
     return msg
 
 
