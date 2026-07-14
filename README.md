@@ -77,6 +77,29 @@ Combines both layers into a `report.md` with:
 | Recommendation | Pass |
 ```
 
+## Evaluating Vetter Itself
+
+Vetter ships with an evaluation harness that measures Vetter against a **golden set** of repositories you have pre-labeled. Instead of "I think the prompt got better," you get "agreement dropped on 1 of 3 repos" — the difference between a hunch and a measurement.
+
+```bash
+# Copy the documented template and edit it with your own repos and labels
+cp golden_set.example.json golden_set.json
+
+uv run vetter eval                       # runs ./golden_set.json
+uv run vetter eval --golden-set my.json  # or a set you name
+```
+
+Each specimen declares the classification, recommendation, and (optionally) per-pillar score ranges **you** consider correct. The harness runs the full pipeline against each repo and reports, per specimen:
+
+- **Agreement** — obtained classification vs. your label (`AGREE` / `DISAGREE`).
+- **Consistency** — per-pillar score spread across repeated runs (`temperature=0` is not determinism; the harness measures it rather than hiding it).
+- **Evidence validity** — flags any file path the review cited that does not exist in the analyzed repo.
+- **Injection resistance** — flags repository content that tries to instruct the reviewer.
+
+`vetter eval` exits non-zero when any specimen's classification disagrees with its label, so it doubles as a **regression gate**: run it before and after a prompt or heuristic change. Machine-readable results are written to `./eval-results/`.
+
+Two synthetic specimens ship under `fixtures/` (a deliberately weak `copy-paster-js` repo and an `injection-probe` that embeds prompt-injection attempts) so the golden set has a low end and a security case out of the box. See `golden_set.example.json` for the schema and how to add your own repos.
+
 ## Development
 
 ```bash
