@@ -7,7 +7,7 @@ import httpx
 import openai
 import pytest
 
-from vetter.models import FileInfo, RepoData
+from vetter.models import FileInfo, RepoData, ScanResult
 from vetter.reviewer import review_repo
 from vetter.router import (
     MAX_ATTEMPTS,
@@ -459,11 +459,155 @@ class TestPipelineFallback:
             files=[FileInfo("app.py", "print('hi')", "Python", 11, False)],
             commits=[], languages={"Python": 1}, total_files=1, total_lines=1,
         )
+        scan = ScanResult(
+            test_ratio=0.0, has_linter_config=False, linter_configs_found=[],
+            commit_count=1, commit_quality="poor", commit_messages=["init"],
+            dependencies=[], error_handling="minimal", security_flags=[],
+            languages={"Python": 1},
+        )
 
         with patch.dict("os.environ", BOTH_KEYS):
-            result = review_repo(repo, model="sonnet")
+            result = review_repo(repo, scan, model="sonnet")
 
         assert result.architecture_awareness.score == 4
         assert result.edge_case_coverage.score == 2
         assert mock_anthropic.return_value.messages.create.call_count == MAX_ATTEMPTS
         assert mock_openai.return_value.chat.completions.create.call_count == 1
+
+
+from vetter.router import MAX_TOOL_TURNS, ToolSpec, complete_with_tools  # noqa: E402
+
+
+def _tool_use_message(name="get_scan_summary", tool_id="tu_1", tool_input=None):
+    block = MagicMock()
+    block.type = "tool_use"
+    block.id = tool_id
+    block.name = name
+    block.input = tool_input or {}
+    msg = MagicMock()
+    msg.stop_reason = "tool_use"
+    msg.content = [block]
+    msg.usage.input_tokens = 100
+    msg.usage.output_tokens = 20
+    return msg
+
+
+def _text_message(text):
+    block = MagicMock()
+    block.type = "text"
+    block.text = text
+    msg = MagicMock()
+    msg.stop_reason = "end_turn"
+    msg.content = [block]
+    msg.usage.input_tokens = 100
+    msg.usage.output_tokens = 30
+    return msg
+
+
+SCAN_TOOL = ToolSpec(name="get_scan_summary", description="Real scan findings.")
+
+
+class TestToolExchange:
+    """Eval 1: tool invocations verified in the actual message exchange."""
+
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_tool_call_round_trip_feeds_real_result_back(self, mock_class):
+        mock_client = MagicMock()
+        mock_class.return_value = mock_client
+        mock_client.messages.create.side_effect = [
+            _tool_use_message(tool_id="tu_42", tool_input={"section": "all"}),
+            _text_message("final review"),
+        ]
+        handler = MagicMock(return_value='{"error_handling": "minimal"}')
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            text = complete_with_tools("sys", "usr", [SCAN_TOOL], handler, model="sonnet")
+
+        assert text == "final review"
+        assert mock_client.messages.create.call_count == 2
+        handler.assert_called_once_with("get_scan_summary", {"section": "all"})
+
+        # Tools are OFFERED on every turn, in Anthropic wire format
+        for call in mock_client.messages.create.call_args_list:
+            assert call.kwargs["tools"] == [{
+                "name": "get_scan_summary",
+                "description": "Real scan findings.",
+                "input_schema": {"type": "object", "properties": {}},
+            }]
+
+        # The second turn carries the handler's real output as the tool_result
+        second_messages = mock_client.messages.create.call_args_list[1].kwargs["messages"]
+        assert second_messages[1]["role"] == "assistant"
+        tool_results = second_messages[2]
+        assert tool_results["role"] == "user"
+        assert tool_results["content"] == [{
+            "type": "tool_result",
+            "tool_use_id": "tu_42",
+            "content": '{"error_handling": "minimal"}',
+        }]
+
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_no_tool_use_returns_text_without_invoking_handler(self, mock_class):
+        mock_client = MagicMock()
+        mock_class.return_value = mock_client
+        mock_client.messages.create.return_value = _text_message("straight answer")
+        handler = MagicMock()
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            text = complete_with_tools("sys", "usr", [SCAN_TOOL], handler)
+
+        assert text == "straight answer"
+        assert mock_client.messages.create.call_count == 1
+        handler.assert_not_called()
+
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_endless_tool_requests_abort_with_clear_error(self, mock_class):
+        mock_client = MagicMock()
+        mock_class.return_value = mock_client
+        mock_client.messages.create.return_value = _tool_use_message()
+        handler = MagicMock(return_value="{}")
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            with pytest.raises(click.ClickException, match="tool exchange"):
+                complete_with_tools("sys", "usr", [SCAN_TOOL], handler)
+
+        assert mock_client.messages.create.call_count == MAX_TOOL_TURNS + 1
+
+    @patch("vetter.router.time.sleep")
+    @patch("vetter.router.openai.OpenAI")
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_fallback_degrades_to_toolless_and_declares_it(
+        self, mock_anthropic, mock_openai, mock_sleep, capsys
+    ):
+        mock_anthropic.return_value = _make_client_raising(
+            _status_error(anthropic.RateLimitError, 429)
+        )
+        mock_openai.return_value = _openai_client_returning("toolless review")
+        handler = MagicMock()
+
+        with patch.dict("os.environ", BOTH_KEYS):
+            text = complete_with_tools("sys", "usr", [SCAN_TOOL], handler, model="sonnet")
+
+        assert text == "toolless review"
+        handler.assert_not_called()
+        openai_kwargs = mock_openai.return_value.chat.completions.create.call_args.kwargs
+        assert "tools" not in openai_kwargs  # degradation is real, not cosmetic
+        assert "without scan tools" in capsys.readouterr().err  # and declared
+
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_each_turn_leaves_a_call_record(self, mock_class, isolated_call_log):
+        mock_client = MagicMock()
+        mock_class.return_value = mock_client
+        mock_client.messages.create.side_effect = [
+            _tool_use_message(),
+            _text_message("done"),
+        ]
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            complete_with_tools("sys", "usr", [SCAN_TOOL], MagicMock(return_value="{}"))
+
+        records = _read_log(isolated_call_log)
+        # Log testimony crossed against the mock's independent evidence
+        assert len(records) == mock_client.messages.create.call_count == 2
+        assert all(r["outcome"] == "success" for r in records)
+        assert all(r["provider"] == "anthropic" for r in records)

@@ -1,10 +1,11 @@
 import json
 import re
+from dataclasses import asdict
 from pathlib import PurePosixPath
 
 import click
 from vetter import router
-from vetter.models import FileInfo, RepoData, ReviewResult, PillarScore
+from vetter.models import FileInfo, RepoData, ReviewResult, PillarScore, ScanResult
 
 
 SYSTEM_PROMPT = """You are a Staff Software Engineer conducting a code review of a candidate's technical test submission.
@@ -254,11 +255,68 @@ def _validate_review_result(result: ReviewResult, raw_response: str) -> None:
         )
 
 
-def review_repo(repo_data: RepoData, model: str = "sonnet") -> ReviewResult:
+# Tools exposing the static scanner's REAL findings to the model during review.
+# Handlers serialize ScanResult fields verbatim — never rewritten or summarized
+# by hand — so the model cannot receive invented scan data.
+SCAN_TOOLS = [
+    router.ToolSpec(
+        name="get_scan_summary",
+        description=(
+            "Automated static-scan findings for the repo under review: test ratio, "
+            "linter configs found, commit count and quality, dependency manifests "
+            "detected, error-handling pattern, and language breakdown. Call this "
+            "before scoring to ground your review in the scan."
+        ),
+    ),
+    router.ToolSpec(
+        name="get_security_flags",
+        description=(
+            "Files where the static scan flagged potential hardcoded secrets. Call "
+            "this when scoring Edge Case Coverage (security considerations)."
+        ),
+    ),
+    router.ToolSpec(
+        name="get_test_metrics",
+        description=(
+            "Test-to-source ratio and file counts from the static scan. Call this "
+            "when scoring Edge Case Coverage (test boundaries)."
+        ),
+    ),
+]
+
+
+def _scan_tool_handler(scan_result: ScanResult, repo_data: RepoData) -> router.ToolHandler:
+    def handle(name: str, _tool_input: dict) -> str:
+        if name == "get_scan_summary":
+            data = asdict(scan_result)
+            data.pop("security_flags")  # has its own tool
+            data.pop("commit_messages")  # bulky; commit_quality already summarizes
+            return json.dumps(data)
+        if name == "get_security_flags":
+            return json.dumps({"security_flags": scan_result.security_flags})
+        if name == "get_test_metrics":
+            source_count = sum(
+                1 for f in repo_data.files
+                if not f.is_test and f.language not in ("Markdown", "JSON", "YAML", "TOML")
+            )
+            test_count = sum(1 for f in repo_data.files if f.is_test)
+            return json.dumps({
+                "test_ratio": scan_result.test_ratio,
+                "source_file_count": source_count,
+                "test_file_count": test_count,
+            })
+        return json.dumps({"error": f"unknown tool: {name}"})
+
+    return handle
+
+
+def review_repo(repo_data: RepoData, scan_result: ScanResult, model: str = "sonnet") -> ReviewResult:
     context = _build_codebase_context(repo_data)
-    response_text = router.complete(
+    response_text = router.complete_with_tools(
         system=SYSTEM_PROMPT,
         user_content=f"Review this candidate's technical test submission:\n\n{context}",
+        tools=SCAN_TOOLS,
+        tool_handler=_scan_tool_handler(scan_result, repo_data),
         model=model,
     )
     result = _parse_review_response(response_text)

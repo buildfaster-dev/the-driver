@@ -1,6 +1,6 @@
 from vetter.models import (
     RepoData, FileInfo, CommitInfo,
-    ScanResult, ReviewResult, PillarScore,
+    ScanResult, ReviewResult, PillarScore, Discrepancy,
 )
 from vetter.report import generate_report, _classify
 
@@ -107,3 +107,41 @@ class TestReportGeneration:
             review_result=_make_review(),
         )
         assert "Warning" in report
+
+
+class TestDiscrepanciesSection:
+    def test_section_always_present_and_says_none_when_empty(self):
+        report = generate_report(
+            repo_data=_make_repo_data(),
+            scan_result=_make_scan(),
+            review_result=_make_review(),
+        )
+        assert "## Scan/Review Discrepancies" in report
+        assert "None detected" in report
+
+    def test_section_names_each_discrepancy_and_resolution(self):
+        discrepancies = [
+            Discrepancy(
+                rule="error-handling-conflict",
+                scan_says="error handling pattern MINIMAL",
+                review_says="Edge Case Coverage 5/5: comprehensive handling",
+                resolution="The scanner does not cover this ecosystem; code evidence stands.",
+            ),
+            Discrepancy(
+                rule="dependencies-conflict",
+                scan_says="no dependency manifest detected",
+                review_says="Code Refinement 5/5: thoughtful libraries",
+                resolution="Manifest format unknown to the scanner; libraries verified in code.",
+            ),
+        ]
+        report = generate_report(
+            repo_data=_make_repo_data(),
+            scan_result=_make_scan(),
+            review_result=_make_review(),
+            discrepancies=discrepancies,
+        )
+        assert "## Scan/Review Discrepancies" in report
+        assert "None detected" not in report
+        for d in discrepancies:
+            assert d.rule in report
+            assert d.resolution in report

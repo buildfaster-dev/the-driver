@@ -37,6 +37,22 @@
 
 ---
 
+## Scan/Review Discrepancies
+
+{% if discrepancies -%}
+The automated scan and the AI review contradicted each other on the points below. Each contradiction was put back to the reviewer for an explicit resolution.
+
+| Rule | Scanner says | Review says | Resolution |
+|------|--------------|-------------|------------|
+{% for d in discrepancies -%}
+| `{{ d.rule }}` | {{ d.scan_says }} | {{ d.review_says }} | {{ d.resolution or "unresolved" }} |
+{% endfor %}
+{% else -%}
+None detected — the automated scan and the AI review are consistent.
+{% endif %}
+
+---
+
 ## Repo Overview
 
 | Metric | Value |

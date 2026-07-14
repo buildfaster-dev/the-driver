@@ -1,7 +1,7 @@
 import os
 from datetime import datetime, timezone
 from jinja2 import Environment, FileSystemLoader
-from vetter.models import RepoData, ScanResult, ReviewResult, Classification
+from vetter.models import RepoData, ScanResult, ReviewResult, Classification, Discrepancy
 
 
 def _classify(review_result: ReviewResult) -> Classification:
@@ -31,6 +31,7 @@ def generate_report(
     review_result: ReviewResult,
     candidate: str | None = None,
     repo_url: str | None = None,
+    discrepancies: list[Discrepancy] | None = None,
 ) -> str:
     classification = _classify(review_result)
 
@@ -51,4 +52,5 @@ def generate_report(
         date=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         source_file_count=len(source_files),
         test_file_count=len(test_files),
+        discrepancies=discrepancies or [],
     )
