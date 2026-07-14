@@ -100,6 +100,16 @@ uv run pytest                        # Run tests
 - Do NOT persist candidate code beyond the analysis session
 - Do NOT log or include API keys in reports
 
+## Language Agnosticism (Product Rule)
+
+- Vetter analyzes candidate repos in ANY language. No heuristic may assume a
+  specific language, framework, or filename convention of the analyzed repo.
+- Multi-language approximations (e.g. import fan-in matching in the context
+  selector) must DECLARE their coverage: which conventions they detect and
+  which they miss.
+- Coverage gaps are closed only when an eval measures them — never tuned
+  blindly against a single reference repo.
+
 ## Implementation Phases
 
 ### Bootstrap (Initial Build)
