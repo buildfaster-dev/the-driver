@@ -3,7 +3,13 @@ import pytest
 import click
 from unittest.mock import patch, MagicMock
 from vetter.models import RepoData, FileInfo
-from vetter.reviewer import review_repo, _parse_review_response, _build_codebase_context, _clamp_score
+from vetter.reviewer import (
+    review_repo,
+    _parse_review_response,
+    _build_codebase_context,
+    _clamp_score,
+    _validate_review_result,
+)
 
 
 VALID_RESPONSE = json.dumps({
@@ -15,7 +21,7 @@ VALID_RESPONSE = json.dumps({
     "code_refinement": {
         "score": 3,
         "justification": "Reasonable code quality.",
-        "evidence": [],
+        "evidence": ["src/app.py:10 — idiomatic loop"],
     },
     "edge_case_coverage": {
         "score": 2,
@@ -79,12 +85,14 @@ class TestReviewRepo:
             with pytest.raises(click.ClickException, match="ANTHROPIC_API_KEY"):
                 review_repo(_make_repo())
 
-    @patch("vetter.reviewer.anthropic.Anthropic")
+    @patch("vetter.router.anthropic.Anthropic")
     def test_successful_review(self, mock_anthropic_class):
         mock_client = MagicMock()
         mock_anthropic_class.return_value = mock_client
         mock_message = MagicMock()
         mock_message.content = [MagicMock(text=VALID_RESPONSE)]
+        mock_message.usage.input_tokens = 1000
+        mock_message.usage.output_tokens = 200
         mock_client.messages.create.return_value = mock_message
 
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
@@ -93,6 +101,41 @@ class TestReviewRepo:
         assert result.architecture_awareness.score == 4
         assert result.code_refinement.score == 3
         assert result.edge_case_coverage.score == 2
+
+
+class TestValidateReviewResult:
+    def _result_from(self, overall_summary=None, **pillar_overrides):
+        data = json.loads(VALID_RESPONSE)
+        for pillar, fields in pillar_overrides.items():
+            data[pillar].update(fields)
+        if overall_summary is not None:
+            data["overall_summary"] = overall_summary
+        raw = json.dumps(data)
+        return _parse_review_response(raw), raw
+
+    def test_valid_result_passes(self):
+        result, raw = self._result_from()
+        _validate_review_result(result, raw)  # must not raise
+
+    def test_empty_justification_rejected(self):
+        result, raw = self._result_from(code_refinement={"justification": "   "})
+        with pytest.raises(click.ClickException, match="empty justification"):
+            _validate_review_result(result, raw)
+
+    def test_empty_evidence_rejected(self):
+        result, raw = self._result_from(edge_case_coverage={"evidence": []})
+        with pytest.raises(click.ClickException, match="no evidence"):
+            _validate_review_result(result, raw)
+
+    def test_blank_evidence_entries_rejected(self):
+        result, raw = self._result_from(architecture_awareness={"evidence": ["  ", ""]})
+        with pytest.raises(click.ClickException, match="no evidence"):
+            _validate_review_result(result, raw)
+
+    def test_empty_overall_summary_rejected(self):
+        result, raw = self._result_from(overall_summary="")
+        with pytest.raises(click.ClickException, match="overall_summary"):
+            _validate_review_result(result, raw)
 
 
 class TestClampScore:
