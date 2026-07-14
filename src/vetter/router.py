@@ -37,6 +37,20 @@ class FatalProviderError(Exception):
     """Non-retryable provider failure: credentials, permissions, bad request."""
 
 
+class BillingProviderError(Exception):
+    """Provider billing/credit failure (e.g. 400 insufficient balance).
+
+    Unlike auth (bad key = config, both providers likely misconfigured) or a
+    malformed request (both would reject), billing is provider-specific account
+    state: switching providers can succeed. So it does NOT retry on the same
+    provider, but DOES escalate to the fallback.
+    """
+
+
+class RunLimitExceeded(Exception):
+    """A single run hit its per-run cost or wall-clock budget — clean cut."""
+
+
 # Model alias → per-provider model id, matched by tier (balanced/top/cheap).
 MODEL_MAP = {
     "sonnet": {"anthropic": "claude-sonnet-4-6", "openai": "gpt-5.6-terra"},
@@ -88,6 +102,17 @@ def _warn_if_pricing_stale() -> None:
 MAX_ATTEMPTS = 3
 BASE_DELAY_S = 2.0
 MAX_TOOL_TURNS = 5  # tool-executing rounds before the exchange is aborted
+
+# Per-run guardrails: a runaway tool loop or a stuck run is cut cleanly rather
+# than producing a surprise bill or hanging.
+RUN_COST_BUDGET_USD = 3.0
+RUN_DEADLINE_S = 900.0  # 15 minutes
+
+
+def _is_billing_error(e: Exception) -> bool:
+    error_type = str(getattr(e, "type", "") or "")
+    text = f"{error_type} {e}".lower()
+    return "billing" in text or "credit balance" in text or ("insufficient" in text and "credit" in text)
 
 # Anthropic prompt-cache rates relative to the input rate, 5m TTL (verified
 # against the installed SDK's cache_control shape and provider pricing docs
@@ -159,15 +184,41 @@ class Provider(Protocol):
     ) -> ProviderResponse: ...
 
 
-def _response_from_message(message) -> ProviderResponse:
-    """Normalize a raw Anthropic message (text + usage incl. cache accounting)."""
+def _first_text_block(message) -> str:
+    """First text block's text, skipping thinking/tool_use in any order.
+
+    No text block at all (thinking-only, tool_use-only, empty) is a typed
+    error, never a silently-wrong review — closes the content[0].text debt.
+    """
+    for block in message.content:
+        if getattr(block, "type", None) == "text":
+            return block.text
+    types = [getattr(b, "type", "?") for b in message.content]
+    raise FatalProviderError(
+        f"anthropic: response contained no text block (block types: {types})"
+    )
+
+
+def _usage_only(message) -> ProviderResponse:
+    """Usage + cache accounting, no text extraction — for per-turn logging.
+
+    A tool_use turn legitimately has no text block; logging must not require
+    one. Text is enforced only when a final review string is returned.
+    """
     return ProviderResponse(
-        text=next((b.text for b in message.content if b.type == "text"), ""),
+        text="",
         input_tokens=message.usage.input_tokens,
         output_tokens=message.usage.output_tokens,
         cache_read_tokens=message.usage.cache_read_input_tokens or 0,
         cache_write_tokens=message.usage.cache_creation_input_tokens or 0,
     )
+
+
+def _response_from_message(message) -> ProviderResponse:
+    """Normalize a final Anthropic message; requires a text block (typed error)."""
+    response = _usage_only(message)
+    response.text = _first_text_block(message)
+    return response
 
 
 class AnthropicProvider:
@@ -231,10 +282,14 @@ class AnthropicProvider:
         except anthropic.AuthenticationError:
             raise FatalProviderError("anthropic: invalid ANTHROPIC_API_KEY. Please check your API key.")
         except anthropic.PermissionDeniedError as e:
+            if _is_billing_error(e):
+                raise BillingProviderError(f"anthropic: billing/credit problem: {e}")
             raise FatalProviderError(f"anthropic: permission denied: {e}")
         except anthropic.NotFoundError as e:
             raise FatalProviderError(f"anthropic: model or endpoint not found: {e}")
         except anthropic.BadRequestError as e:
+            if _is_billing_error(e):
+                raise BillingProviderError(f"anthropic: billing/credit problem: {e}")
             raise FatalProviderError(f"anthropic: bad request: {e}")
         except (anthropic.RateLimitError, anthropic.InternalServerError) as e:
             raise TransientProviderError(f"anthropic: {e}")
@@ -393,6 +448,9 @@ def _call_with_retry(
         except FatalProviderError as e:
             _record(provider, model_id, started, "error:fatal", error=e)
             raise
+        except BillingProviderError as e:
+            _record(provider, model_id, started, "error:billing", error=e)
+            raise  # no same-provider retry; the ladder escalates to fallback
         _record(provider, model_id, started, success_outcome, response=response)
         return response
     raise AssertionError("unreachable")
@@ -421,7 +479,10 @@ def _create_message_with_retry(
         except FatalProviderError as e:
             _record(provider, model_id, started, "error:fatal", error=e)
             raise
-        _record(provider, model_id, started, "success", response=_response_from_message(message))
+        except BillingProviderError as e:
+            _record(provider, model_id, started, "error:billing", error=e)
+            raise
+        _record(provider, model_id, started, "success", response=_usage_only(message))
         return message
     raise AssertionError("unreachable")
 
@@ -435,21 +496,44 @@ def _run_tool_exchange(
     temperature: float,
     tools: list[ToolSpec],
     tool_handler: ToolHandler,
+    max_cost_usd: float = RUN_COST_BUDGET_USD,
+    deadline_s: float = RUN_DEADLINE_S,
 ) -> ProviderResponse:
     """Drive the tool_use loop until the model stops calling tools.
 
-    Anthropic-only by design: the fallback provider runs tool-less (declared
-    degradation — resilience path delivers a review, not tool parity).
+    Per-run caps: a completed answer is never cut, but a runaway loop that
+    keeps requesting tools past the cost budget or wall-clock deadline is
+    stopped with RunLimitExceeded. Anthropic-only by design: the fallback
+    provider runs tool-less (declared degradation).
     """
     messages: list[dict] = [{"role": "user", "content": user_content}]
+    started_wall = time.monotonic()
+    cost_so_far = 0.0
     last = None
-    for _turn in range(MAX_TOOL_TURNS + 1):
+    for turn in range(MAX_TOOL_TURNS + 1):
         message = _create_message_with_retry(
             provider, system, messages, model_id, max_tokens, temperature, tools
         )
         last = message
+        cost_so_far += _cost_usd(
+            model_id,
+            message.usage.input_tokens,
+            message.usage.output_tokens,
+            message.usage.cache_read_input_tokens or 0,
+            message.usage.cache_creation_input_tokens or 0,
+        ) or 0.0
         if message.stop_reason != "tool_use":
             return _response_from_message(message)
+        # More tool turns requested — enforce caps before spending another one.
+        if cost_so_far > max_cost_usd:
+            raise RunLimitExceeded(
+                f"per-run cost budget ${max_cost_usd:.2f} exceeded "
+                f"(spent ${cost_so_far:.2f}) after {turn + 1} tool turn(s)"
+            )
+        if time.monotonic() - started_wall > deadline_s:
+            raise RunLimitExceeded(
+                f"per-run deadline {deadline_s:.0f}s exceeded after {turn + 1} tool turn(s)"
+            )
         tool_uses = [b for b in message.content if b.type == "tool_use"]
         messages.append({"role": "assistant", "content": message.content})
         messages.append({
@@ -495,6 +579,9 @@ def complete(
         return _call_with_retry(primary, system, user_content, primary_model, max_tokens, temperature).text
     except FatalProviderError as e:
         raise click.ClickException(str(e))
+    except BillingProviderError as e:
+        click.echo(f"Warning: anthropic billing failed ({e}); trying fallback.", err=True)
+        primary_error = e
     except TransientProviderError as e:
         primary_error = e
 
@@ -510,10 +597,10 @@ def _fallback_completion(
     max_tokens: int,
     temperature: float,
     primary_model: str,
-    primary_error: TransientProviderError,
+    primary_error: Exception,
     tools_degraded: bool = False,
 ) -> str:
-    """Climb the ladder: primary exhausted its retries on transient errors only."""
+    """Climb the ladder: primary failed on a transient or billing error."""
     try:
         fallback = OpenAIProvider()
     except FatalProviderError as e:
@@ -579,8 +666,13 @@ def complete_with_tools(
         ).text
     except FatalProviderError as e:
         raise click.ClickException(str(e))
+    except BillingProviderError as e:
+        click.echo(f"Warning: anthropic billing failed ({e}); trying fallback.", err=True)
+        primary_error = e
     except TransientProviderError as e:
         primary_error = e
+    # RunLimitExceeded is intentionally NOT caught here: a per-run budget cut is
+    # not a provider failure, so it propagates to the caller for a partial report.
 
     return _fallback_completion(
         system, user_content, model, max_tokens, temperature, primary_model, primary_error,

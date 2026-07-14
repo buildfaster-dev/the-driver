@@ -28,6 +28,7 @@ def generate_report(
     candidate: str | None = None,
     repo_url: str | None = None,
     discrepancies: list[Discrepancy] | None = None,
+    injection_attempts: list[str] | None = None,
 ) -> str:
     classification = _classify(review_result)
 
@@ -49,4 +50,5 @@ def generate_report(
         source_file_count=len(source_files),
         test_file_count=len(test_files),
         discrepancies=discrepancies or [],
+        injection_attempts=injection_attempts or [],
     )

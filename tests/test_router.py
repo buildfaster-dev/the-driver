@@ -842,3 +842,181 @@ class TestPricingFreshness:
             complete("sys", "user")
 
         assert "PRICING table" not in capsys.readouterr().err
+
+
+from vetter.router import _first_text_block, _response_from_message  # noqa: E402
+
+
+def _block(block_type, text=None):
+    b = MagicMock()
+    b.type = block_type
+    if text is not None:
+        b.text = text
+    return b
+
+
+def _message_with(blocks):
+    msg = MagicMock()
+    msg.content = blocks
+    msg.usage.input_tokens = 10
+    msg.usage.output_tokens = 5
+    msg.usage.cache_read_input_tokens = 0
+    msg.usage.cache_creation_input_tokens = 0
+    return msg
+
+
+class TestBlockValidation:
+    """Eval 2 (phase 08): correct parse or a clear typed error, never IndexError."""
+
+    def test_thinking_then_text_picks_the_text(self):
+        msg = _message_with([_block("thinking"), _block("text", "the real answer")])
+        assert _response_from_message(msg).text == "the real answer"
+
+    def test_text_after_tool_use_is_found(self):
+        msg = _message_with([_block("tool_use"), _block("text", "answer")])
+        assert _first_text_block(msg) == "answer"
+
+    def test_only_tool_use_raises_typed_error(self):
+        msg = _message_with([_block("tool_use")])
+        with pytest.raises(FatalProviderError, match="no text block"):
+            _response_from_message(msg)
+
+    def test_only_thinking_raises_typed_error(self):
+        msg = _message_with([_block("thinking")])
+        with pytest.raises(FatalProviderError, match="block types.*thinking"):
+            _first_text_block(msg)
+
+    def test_empty_content_raises_typed_error(self):
+        with pytest.raises(FatalProviderError, match="no text block"):
+            _first_text_block(_message_with([]))
+
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_no_text_block_surfaces_as_click_exception(self, mock_class):
+        mock_client = MagicMock()
+        mock_class.return_value = mock_client
+        mock_client.messages.create.return_value = _message_with([_block("tool_use")])
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            with pytest.raises(click.ClickException, match="no text block"):
+                complete("sys", "user")
+
+
+from vetter.router import (  # noqa: E402
+    RUN_COST_BUDGET_USD,
+    BillingProviderError,
+    RunLimitExceeded,
+    _is_billing_error,
+)
+
+
+class TestBillingRouting:
+    """Decision: billing-400 escalates to the fallback; 401 stays fatal."""
+
+    def _billing_error(self, cls, status):
+        err = _status_error(cls, status)
+        err.type = "billing_error"
+        return err
+
+    @patch("vetter.router.time.sleep")
+    @patch("vetter.router.openai.OpenAI")
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_billing_400_falls_back_without_retry(self, mock_anthropic, mock_openai, mock_sleep, capsys):
+        mock_anthropic.return_value = _make_client_raising(
+            self._billing_error(anthropic.BadRequestError, 400)
+        )
+        mock_openai.return_value = _openai_client_returning("fallback saved it")
+
+        with patch.dict("os.environ", BOTH_KEYS):
+            text = complete("sys", "user", model="sonnet")
+
+        assert text == "fallback saved it"
+        # No same-provider retry on billing: exactly one primary attempt
+        assert mock_anthropic.return_value.messages.create.call_count == 1
+        assert mock_openai.return_value.chat.completions.create.call_count == 1
+        assert "billing failed" in capsys.readouterr().err
+
+    @patch("vetter.router.openai.OpenAI")
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_auth_401_stays_fatal_no_fallback(self, mock_anthropic, mock_openai):
+        mock_anthropic.return_value = _make_client_raising(
+            _status_error(anthropic.AuthenticationError, 401)
+        )
+        with patch.dict("os.environ", BOTH_KEYS):
+            with pytest.raises(click.ClickException, match="ANTHROPIC_API_KEY"):
+                complete("sys", "user")
+        mock_openai.assert_not_called()
+
+    def test_billing_logged_distinctly(self, monkeypatch, isolated_call_log):
+        # Billing failure gets its own outcome in the receipt.
+        with patch("vetter.router.openai.OpenAI") as mock_openai, \
+             patch("vetter.router.anthropic.Anthropic") as mock_anthropic:
+            mock_anthropic.return_value = _make_client_raising(
+                self._billing_error(anthropic.BadRequestError, 400)
+            )
+            mock_openai.return_value = _openai_client_returning("ok")
+            with patch.dict("os.environ", BOTH_KEYS):
+                complete("sys", "user")
+        records = _read_log(isolated_call_log)
+        assert any(r["outcome"] == "error:billing" and r["provider"] == "anthropic" for r in records)
+
+    def test_is_billing_error_detects_message_and_type(self):
+        e1 = MagicMock(); e1.type = "billing_error"
+        assert _is_billing_error(e1)
+        e2 = Exception("Your credit balance is too low")
+        assert _is_billing_error(e2)
+        e3 = Exception("messages: roles must alternate")
+        assert not _is_billing_error(e3)
+
+
+def _cheap_tool_message():
+    """A tool_use turn with tiny cost, so the budget isn't hit by cost."""
+    msg = _tool_use_message()
+    msg.usage.input_tokens = 10
+    msg.usage.output_tokens = 5
+    return msg
+
+
+class TestRunCaps:
+    """Eval 3 (phase 08): a runaway run is cut cleanly with a declared reason."""
+
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_cost_budget_cuts_runaway_tool_loop(self, mock_class):
+        mock_client = MagicMock()
+        mock_class.return_value = mock_client
+        # Every turn requests tools and costs a lot → budget exceeded fast.
+        expensive = _tool_use_message()
+        expensive.usage.input_tokens = 200_000  # ~$0.60/turn on sonnet
+        expensive.usage.output_tokens = 100
+        mock_client.messages.create.return_value = expensive
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            with pytest.raises(RunLimitExceeded, match="cost budget"):
+                complete_with_tools("sys", "u" * 4000, [SCAN_TOOL], MagicMock(return_value="{}"))
+
+        # Cut before burning all 5 turns (5 * $0.60 = $3.0 budget)
+        assert mock_client.messages.create.call_count <= 6
+
+    @patch("vetter.router.time.monotonic")
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_deadline_cuts_stuck_run(self, mock_class, mock_monotonic):
+        mock_client = MagicMock()
+        mock_class.return_value = mock_client
+        mock_client.messages.create.return_value = _cheap_tool_message()
+        # First call sets started_wall=0; subsequent checks jump past the deadline.
+        mock_monotonic.side_effect = [0.0] + [10_000.0] * 20
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            with pytest.raises(RunLimitExceeded, match="deadline"):
+                complete_with_tools("sys", "u" * 4000, [SCAN_TOOL], MagicMock(return_value="{}"))
+
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_completed_run_is_never_cut(self, mock_class):
+        mock_client = MagicMock()
+        mock_class.return_value = mock_client
+        # One tool turn, then a final answer — under budget, must return.
+        mock_client.messages.create.side_effect = [_cheap_tool_message(), _text_message("done")]
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            text = complete_with_tools("sys", "u" * 4000, [SCAN_TOOL], MagicMock(return_value="{}"))
+
+        assert text == "done"
