@@ -8,6 +8,7 @@ from vetter.reviewer import (
     _parse_review_response,
     _build_codebase_context,
     _clamp_score,
+    _render_file_block,
     _validate_review_result,
 )
 
@@ -77,6 +78,118 @@ class TestBuildContext:
         repo = _make_repo()
         context = _build_codebase_context(repo)
         assert "print('hello')" in context
+
+
+def _src(path, content, language="Python", is_test=False):
+    return FileInfo(path, content, language, len(content), is_test)
+
+
+def _repo_with(files):
+    return RepoData(
+        path="/fake/repo", files=files, commits=[],
+        languages={"Python": len(files)}, total_files=len(files),
+        total_lines=sum(len(f.content.splitlines()) for f in files),
+    )
+
+
+def _omitted_section(context):
+    marker = "## Files Omitted from Context"
+    assert marker in context, "omitted files were not announced"
+    return context.split(marker, 1)[1]
+
+
+class TestContextSelection:
+    """Effects only: which file contents made it into the context, which didn't."""
+
+    def test_entry_point_without_refs_beats_mid_fan_in_hub(self):
+        # The weight conflict, pinned: ENTRY_POINT_BONUS (6) > FAN_IN_CAP (5),
+        # so an unreferenced entry point must win over a mid-fan-in hub.
+        entry = _src("main.py", "print('the entry point')")
+        hub = _src("helpers.py", "def shared_helper(): return 42")
+        refs = [_src(f"caller{i}.py", "import helpers\n") for i in range(3)]
+        repo = _repo_with([entry, hub, *refs])
+
+        budget = len(_render_file_block(entry))  # room for exactly one block
+        context = _build_codebase_context(repo, char_budget=budget)
+
+        assert "print('the entry point')" in context
+        assert "def shared_helper" not in context
+        omitted = _omitted_section(context)
+        assert "helpers.py" in omitted
+
+    def test_small_hub_survives_giant_low_signal_file(self):
+        giant = _src("generated.py", "GENERATED_BLOB = 1\n" * 5000)
+        core = _src("src/core.py", "class Core:\n    pass")
+        refs = [_src(f"src/mod{i}.py", "from core import Core\n") for i in range(3)]
+        repo = _repo_with([giant, core, *refs])
+
+        context = _build_codebase_context(repo, char_budget=500)
+
+        assert "class Core" in context
+        assert "GENERATED_BLOB" not in context
+        assert "generated.py" in _omitted_section(context)
+
+    def test_fan_in_matches_pascal_case_references(self):
+        # Elixir-style: file circuit_breaker.ex, module CircuitBreaker.
+        breaker = _src("lib/circuit_breaker.ex", "defmodule CircuitBreaker do\nend", language="Other")
+        orphan = _src("lib/orphan_module.ex", "defmodule OrphanModule do\nend", language="Other")
+        refs = [
+            _src(f"lib/user{i}.ex", "alias MyApp.CircuitBreaker\n", language="Other")
+            for i in range(3)
+        ]
+        repo = _repo_with([breaker, orphan, *refs])
+
+        budget = len(_render_file_block(breaker))  # one block only
+        context = _build_codebase_context(repo, char_budget=budget)
+
+        assert "defmodule CircuitBreaker" in context
+        assert "defmodule OrphanModule" not in context
+        assert "orphan_module.ex" in _omitted_section(context)
+
+    def test_every_file_is_either_included_or_announced(self):
+        files = [
+            _src("alpha.py", "ALPHA_CONTENT = 1"),
+            _src("beta.py", "BETA_CONTENT = 2"),
+            _src("gamma.py", "GAMMA_CONTENT = 3"),
+            _src("test_alpha.py", "TEST_ALPHA_CONTENT = 4", is_test=True),
+        ]
+        repo = _repo_with(files)
+
+        context = _build_codebase_context(repo, char_budget=10)  # nothing fits
+
+        omitted = _omitted_section(context)
+        for f in files:
+            assert f.content not in context
+            assert f.path in omitted
+
+    def test_rendered_blocks_are_charged_against_budget(self):
+        # Headers and fences count too: the sum of included rendered blocks
+        # never exceeds the budget.
+        files = [_src(f"file{i}.py", f"CONTENT_{i} = {i}" * 10) for i in range(8)]
+        repo = _repo_with(files)
+        budget = 300
+
+        context = _build_codebase_context(repo, char_budget=budget)
+
+        included = [f for f in files if f.content in context]
+        excluded = [f for f in files if f.content not in context]
+        assert included, "budget should fit at least one file"
+        assert excluded, "budget should force at least one exclusion"
+        assert sum(len(_render_file_block(f)) for f in included) <= budget
+        omitted = _omitted_section(context)
+        for f in excluded:
+            assert f.path in omitted
+
+    def test_selection_is_deterministic(self):
+        files = [
+            _src("main.py", "entry"),
+            _src("zeta.py", "z" * 200),
+            _src("alpha.py", "a" * 200),
+        ]
+        repo = _repo_with(files)
+        assert _build_codebase_context(repo, char_budget=250) == _build_codebase_context(
+            repo, char_budget=250
+        )
 
 
 class TestReviewRepo:
