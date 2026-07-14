@@ -1,7 +1,10 @@
 import json
+import re
+from pathlib import PurePosixPath
+
 import click
 from vetter import router
-from vetter.models import RepoData, ReviewResult, PillarScore
+from vetter.models import FileInfo, RepoData, ReviewResult, PillarScore
 
 
 SYSTEM_PROMPT = """You are a Staff Software Engineer conducting a code review of a candidate's technical test submission.
@@ -54,7 +57,86 @@ Respond ONLY with valid JSON in this exact format:
 }"""
 
 
-def _build_codebase_context(repo_data: RepoData) -> str:
+CONTEXT_CHAR_BUDGET = 400_000
+
+# Signal-scoring weights. The order of precedence is deliberate and explicit:
+# ENTRY_POINT_BONUS > FAN_IN_CAP, so an entry point with zero incoming
+# references still outranks any pure fan-in hub — being the place where the
+# system starts is stronger evidence of signal than being widely imported.
+ENTRY_POINT_BONUS = 6
+CONFIG_MODULE_BONUS = 4
+FAN_IN_CAP = 5  # +1 per referencing file, capped here
+ROOT_LEVEL_BONUS = 1  # file sits at the repo root
+
+ENTRY_POINT_STEMS = {"main", "app", "cli", "index", "server", "application", "__main__"}
+CONFIG_MODULE_STEMS = {"settings", "config", "conf"}
+
+# Cross-language approximation of "lines that reference other modules".
+# "alias " is Elixir's module reference — without it, every Elixir repo
+# reads as zero fan-in and signal ranking collapses to size.
+_IMPORT_LINE_PREFIXES = ("import ", "from ", "require", "use ", "using ", "include ", "alias ")
+
+
+def _import_lines(content: str) -> str:
+    return "\n".join(
+        line for line in content.splitlines() if line.lstrip().startswith(_IMPORT_LINE_PREFIXES)
+    )
+
+
+def _fan_in_counts(files: list[FileInfo]) -> dict[str, int]:
+    """How many OTHER files reference each file's stem in their import lines.
+
+    Word-boundary match on stems of >=3 chars — an approximation that trades
+    precision for language-agnosticism (no parser per language).
+    """
+    import_texts = {f.path: _import_lines(f.content) for f in files}
+    counts: dict[str, int] = {}
+    for f in files:
+        stem = PurePosixPath(f.path).stem
+        if len(stem) < 3:
+            counts[f.path] = 0
+            continue
+        # Match the stem as written and as PascalCase: Elixir/Ruby/etc. name
+        # the module CircuitBreaker while the file is circuit_breaker.ex.
+        pascal = "".join(part.capitalize() for part in stem.split("_"))
+        pattern = re.compile(rf"\b({re.escape(stem)}|{re.escape(pascal)})\b")
+        counts[f.path] = sum(
+            1 for path, text in import_texts.items() if path != f.path and pattern.search(text)
+        )
+    return counts
+
+
+def _signal_score(f: FileInfo, fan_in: int) -> int:
+    stem = PurePosixPath(f.path).stem.lower()
+    score = min(fan_in, FAN_IN_CAP)
+    if stem in ENTRY_POINT_STEMS:
+        score += ENTRY_POINT_BONUS
+    if stem in CONFIG_MODULE_STEMS:
+        score += CONFIG_MODULE_BONUS
+    if len(PurePosixPath(f.path).parts) == 1:
+        score += ROOT_LEVEL_BONUS
+    return score
+
+
+def _rank_by_signal(files: list[FileInfo], fan_in_counts: dict[str, int]) -> list[FileInfo]:
+    """Highest signal first; among equals, smallest first (path as final tiebreak)."""
+    return sorted(
+        files, key=lambda f: (-_signal_score(f, fan_in_counts[f.path]), f.size, f.path)
+    )
+
+
+def _render_file_block(f: FileInfo) -> str:
+    return f"\n### {f.path}\n```{f.language.lower()}\n{f.content}\n```"
+
+
+def _build_codebase_context(repo_data: RepoData, char_budget: int = CONTEXT_CHAR_BUDGET) -> str:
+    """Build the review context, filling the budget by signal instead of size.
+
+    The full rendered block (header + fences + content) is charged against the
+    budget. Files that don't fit are announced in a final omitted-files list —
+    one short line each, exempt from the budget so the announcement can never
+    be silently dropped.
+    """
     parts = []
 
     parts.append("## File Tree")
@@ -69,35 +151,35 @@ def _build_codebase_context(repo_data: RepoData) -> str:
     for commit in repo_data.commits[:30]:
         parts.append(f"  [{commit.hash}] {commit.message} (by {commit.author}, +{commit.insertions}/-{commit.deletions})")
 
-    parts.append("\n## Source Files")
     source_files = [f for f in repo_data.files if not f.is_test and f.language not in ("JSON", "YAML", "TOML", "Markdown")]
-    source_files.sort(key=lambda x: x.size, reverse=True)
-
-    char_budget = 400_000
-    chars_used = 0
-    for f in source_files:
-        if chars_used + len(f.content) > char_budget:
-            parts.append(f"\n### {f.path} [TRUNCATED — file too large for context]")
-            continue
-        parts.append(f"\n### {f.path}")
-        parts.append(f"```{f.language.lower()}")
-        parts.append(f.content)
-        parts.append("```")
-        chars_used += len(f.content)
-
     test_files = [f for f in repo_data.files if f.is_test]
-    test_files.sort(key=lambda x: x.size, reverse=True)
+    fan_in = _fan_in_counts(repo_data.files)
+
+    chars_used = 0
+    omitted: list[FileInfo] = []
+
+    parts.append("\n## Source Files")
+    for f in _rank_by_signal(source_files, fan_in):
+        block = _render_file_block(f)
+        if chars_used + len(block) > char_budget:
+            omitted.append(f)
+            continue
+        parts.append(block)
+        chars_used += len(block)
 
     parts.append("\n## Test Files")
-    for f in test_files:
-        if chars_used + len(f.content) > char_budget:
-            parts.append(f"\n### {f.path} [TRUNCATED]")
+    for f in _rank_by_signal(test_files, fan_in):
+        block = _render_file_block(f)
+        if chars_used + len(block) > char_budget:
+            omitted.append(f)
             continue
-        parts.append(f"\n### {f.path}")
-        parts.append(f"```{f.language.lower()}")
-        parts.append(f.content)
-        parts.append("```")
-        chars_used += len(f.content)
+        parts.append(block)
+        chars_used += len(block)
+
+    if omitted:
+        parts.append("\n## Files Omitted from Context (over budget)")
+        for f in omitted:
+            parts.append(f"  {f.path} ({f.language}, {f.size}B)")
 
     return "\n".join(parts)
 
