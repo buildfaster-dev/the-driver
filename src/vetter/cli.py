@@ -1,4 +1,7 @@
+import json
 import os
+from datetime import datetime, timezone
+
 import click
 from rich.console import Console
 
@@ -78,3 +81,31 @@ def analyze(repo_path: str, candidate: str | None, repo_url: str | None, output:
         raise click.ClickException(f"Permission denied: {e}")
     except Exception as e:
         raise click.ClickException(f"Unexpected error: {e}")
+
+
+@main.command("eval")
+@click.option("--golden-set", "golden_set_path", default="./golden_set.json",
+              help="Path to the golden set JSON (default: ./golden_set.json).")
+@click.option("--model", default="sonnet", help="Claude model alias (default: sonnet).")
+@click.option("--output-dir", default="./eval-results",
+              help="Directory for machine-readable results (default: ./eval-results).")
+def eval_cmd(golden_set_path: str, model: str, output_dir: str):
+    """Run the golden-set evaluation harness and report agreement.
+
+    Exits non-zero when any specimen's classification disagrees with its
+    human label (regression signal).
+    """
+    from vetter.eval_harness import format_summary, run_eval
+
+    results, exit_code = run_eval(golden_set_path, model=model, echo=console.print)
+
+    os.makedirs(output_dir, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
+    output_path = os.path.join(output_dir, f"run-{stamp}.json")
+    with open(output_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+    console.print(format_summary(results))
+    console.print(f"Machine-readable results: [bold]{output_path}[/bold]")
+    if exit_code != 0:
+        raise SystemExit(exit_code)
