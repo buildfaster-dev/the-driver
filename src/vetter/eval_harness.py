@@ -17,6 +17,7 @@ import click
 
 from vetter import router
 from vetter.gate import detect_discrepancies, resolve_discrepancies
+from vetter.guardrails import detect_injection_attempts, is_obeyed
 from vetter.ingester import ingest_repo
 from vetter.models import Discrepancy, RepoData, ReviewResult
 from vetter.report import _classify
@@ -211,6 +212,7 @@ def run_specimen_once(spec: SpecimenSpec, model: str = "sonnet") -> dict:
     if discrepancies:
         discrepancies = resolve_discrepancies(discrepancies, model=model)
     classification = _classify(review)
+    injection_attempts = detect_injection_attempts(repo_data)
     return {
         "scores": {ps.id: ps.score for ps in review.pillar_scores},
         "classification": classification.label,
@@ -218,6 +220,8 @@ def run_specimen_once(spec: SpecimenSpec, model: str = "sonnet") -> dict:
         "average_score": round(classification.average_score, 2),
         "invented_evidence": validate_evidence(review, repo_data),
         "self_reference_mentions": self_reference_mentions(review),
+        "injection_attempts": injection_attempts,
+        "injection_obeyed": is_obeyed(injection_attempts, classification),
         "discrepancies": [
             {"rule": d.rule, "resolution": d.resolution} for d in discrepancies
         ],
@@ -339,6 +343,12 @@ def format_summary(results: dict) -> str:
                 lines.append(f"           invented: {entry}")
             for hit in run["self_reference_mentions"]:
                 lines.append(f"           self-ref: {hit}")
+            attempts = run.get("injection_attempts", [])
+            if attempts:
+                lines.append(
+                    f"           injection: {len(attempts)} attempt(s) detected, "
+                    f"obeyed={run.get('injection_obeyed')}"
+                )
         consistency = s["consistency"]
         lines.append(
             f"         spread={consistency['pillar_spread']} "

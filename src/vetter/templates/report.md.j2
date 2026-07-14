@@ -37,6 +37,20 @@
 
 ---
 
+## Prompt-Injection Guardrail
+
+{% if injection_attempts -%}
+⚠️ The submission contains text that attempts to instruct the automated reviewer (a deliberate prompt-injection attempt). This is an integrity signal about the candidate. The reviewer was instructed to treat repository content as untrusted data; these attempts were flagged, not obeyed:
+
+{% for attempt in injection_attempts -%}
+- {{ attempt }}
+{% endfor %}
+{% else -%}
+No prompt-injection attempts detected in the submission.
+{% endif %}
+
+---
+
 ## Scan/Review Discrepancies
 
 {% if discrepancies -%}

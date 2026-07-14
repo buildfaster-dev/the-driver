@@ -100,3 +100,23 @@ class TestCLISuccess:
             assert "Trace:" in result.output
             for stage in ("ingest", "scan", "review", "gate", "report"):
                 assert f"{stage} " in result.output.split("Trace:")[1]
+
+    @patch("vetter.cli.review_repo")
+    def test_run_limit_writes_partial_report(self, mock_review):
+        from vetter.router import RunLimitExceeded
+        mock_review.side_effect = RunLimitExceeded(
+            "per-run cost budget $3.00 exceeded (spent $3.10) after 6 tool turn(s)"
+        )
+        runner = CliRunner()
+        repo_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = os.path.join(tmpdir, "report.md")
+            result = runner.invoke(main, ["analyze", repo_path, "--output", output_path])
+
+            assert result.exit_code == 2  # cut, not a clean success
+            assert os.path.exists(output_path)
+            with open(output_path) as f:
+                report = f.read()
+            assert "INCOMPLETE" in report
+            assert "not scored" in report
+            assert "cost budget" in report  # declares the reason

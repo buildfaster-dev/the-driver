@@ -9,7 +9,9 @@ from vetter.ingester import ingest_repo
 from vetter.scanner import scan_repo
 from vetter.reviewer import review_repo
 from vetter.gate import detect_discrepancies, resolve_discrepancies
+from vetter.guardrails import detect_injection_attempts
 from vetter.report import generate_report
+from vetter.router import RunLimitExceeded
 from vetter.trace import StageTimer
 
 console = Console()
@@ -46,6 +48,10 @@ def analyze(repo_path: str, candidate: str | None, repo_url: str | None, output:
 
         console.print("[green]✓[/green] Automated scan complete")
 
+        injection_attempts = detect_injection_attempts(repo_data)
+        if injection_attempts:
+            console.print(f"[yellow]![/yellow] Guardrail: {len(injection_attempts)} prompt-injection attempt(s) detected in submission")
+
         with console.status("[bold green]Running AI expert review..."), timer.stage("review"):
             review_result = review_repo(repo_data, scan_result, model=model)
 
@@ -69,6 +75,7 @@ def analyze(repo_path: str, candidate: str | None, repo_url: str | None, output:
                 candidate=candidate,
                 repo_url=repo_url,
                 discrepancies=discrepancies,
+                injection_attempts=injection_attempts,
             )
 
             with open(output, "w") as f:
@@ -76,6 +83,22 @@ def analyze(repo_path: str, candidate: str | None, repo_url: str | None, output:
 
         console.print(f"[green]✓[/green] Report saved to [bold]{output}[/bold]")
         click.echo(timer.summary(), err=True)
+    except RunLimitExceeded as e:
+        # Honest partial report: the run was cut, the candidate was not scored.
+        partial = (
+            "# Candidate Assessment Report — INCOMPLETE\n\n"
+            f"**Analysis stopped before completion: {e}**\n\n"
+            "The per-run guardrail cut this analysis to avoid a runaway cost or "
+            "an indefinite hang. The candidate was **not scored**; no "
+            "classification or recommendation was produced. Re-run with a higher "
+            "budget if this repository legitimately requires more analysis.\n"
+        )
+        with open(output, "w") as f:
+            f.write(partial)
+        console.print(f"[red]✗[/red] Run cut by guardrail: {e}")
+        console.print(f"[yellow]![/yellow] Partial report saved to [bold]{output}[/bold]")
+        click.echo(timer.summary(), err=True)
+        raise SystemExit(2)
     except click.ClickException:
         raise
     except FileNotFoundError as e:
