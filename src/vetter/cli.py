@@ -10,6 +10,7 @@ from vetter.scanner import scan_repo
 from vetter.reviewer import review_repo
 from vetter.gate import detect_discrepancies, resolve_discrepancies
 from vetter.report import generate_report
+from vetter.trace import StageTimer
 
 console = Console()
 
@@ -33,23 +34,24 @@ def analyze(repo_path: str, candidate: str | None, repo_url: str | None, output:
     if not os.path.isdir(output_dir):
         raise click.ClickException(f"Output directory does not exist: {output_dir}")
 
+    timer = StageTimer()
     try:
-        with console.status("[bold green]Ingesting repository..."):
+        with console.status("[bold green]Ingesting repository..."), timer.stage("ingest"):
             repo_data = ingest_repo(repo_path)
 
         console.print(f"[green]✓[/green] Ingested {repo_data.total_files} files, {len(repo_data.commits)} commits")
 
-        with console.status("[bold green]Running automated scan..."):
+        with console.status("[bold green]Running automated scan..."), timer.stage("scan"):
             scan_result = scan_repo(repo_data)
 
         console.print("[green]✓[/green] Automated scan complete")
 
-        with console.status("[bold green]Running AI expert review..."):
+        with console.status("[bold green]Running AI expert review..."), timer.stage("review"):
             review_result = review_repo(repo_data, scan_result, model=model)
 
         console.print("[green]✓[/green] AI review complete")
 
-        with console.status("[bold green]Confronting scan vs review..."):
+        with console.status("[bold green]Confronting scan vs review..."), timer.stage("gate"):
             discrepancies = detect_discrepancies(scan_result, review_result)
             if discrepancies:
                 discrepancies = resolve_discrepancies(discrepancies, model=model)
@@ -59,7 +61,7 @@ def analyze(repo_path: str, candidate: str | None, repo_url: str | None, output:
         else:
             console.print("[green]✓[/green] Gate: scan and review are consistent")
 
-        with console.status("[bold green]Generating report..."):
+        with console.status("[bold green]Generating report..."), timer.stage("report"):
             report = generate_report(
                 repo_data=repo_data,
                 scan_result=scan_result,
@@ -69,10 +71,11 @@ def analyze(repo_path: str, candidate: str | None, repo_url: str | None, output:
                 discrepancies=discrepancies,
             )
 
-        with open(output, "w") as f:
-            f.write(report)
+            with open(output, "w") as f:
+                f.write(report)
 
         console.print(f"[green]✓[/green] Report saved to [bold]{output}[/bold]")
+        click.echo(timer.summary(), err=True)
     except click.ClickException:
         raise
     except FileNotFoundError as e:

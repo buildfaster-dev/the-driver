@@ -20,7 +20,7 @@ import os
 import random
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -49,8 +49,8 @@ MODEL_MAP = {
 # default model instead.
 DEFAULT_MODELS = {"openai": "gpt-5.6-terra"}
 
-# USD per million tokens (input, output). Checked against provider pricing
-# docs on 2026-07-12. Unknown models log cost_usd as null rather than a guess.
+# USD per million tokens (input, output). Verified on PRICING_VERIFIED_ON
+# (see below). Unknown models log cost_usd as null rather than a guess.
 PRICING = {
     "claude-sonnet-4-6": (3.00, 15.00),
     "claude-opus-4-6": (5.00, 25.00),
@@ -60,9 +60,49 @@ PRICING = {
     "gpt-5.6-luna": (1.00, 6.00),
 }
 
+# Update BOTH lines when re-verifying prices against provider docs. Past
+# PRICING_MAX_AGE_DAYS without re-verification, every run warns loudly on
+# stderr (providers move prices on a roughly quarterly cadence; a quarter
+# unverified means cost_usd may be silently rotten).
+PRICING_VERIFIED_ON = date(2026, 7, 13)
+PRICING_MAX_AGE_DAYS = 90
+_pricing_warning_emitted = False
+
+
+def _warn_if_pricing_stale() -> None:
+    """Loud warning, never a crash: the run continues with suspect cost_usd."""
+    global _pricing_warning_emitted
+    if _pricing_warning_emitted:
+        return
+    age_days = (date.today() - PRICING_VERIFIED_ON).days
+    if age_days > PRICING_MAX_AGE_DAYS:
+        _pricing_warning_emitted = True
+        click.echo(
+            f"Warning: PRICING table last verified {age_days} days ago "
+            f"({PRICING_VERIFIED_ON.isoformat()}, max {PRICING_MAX_AGE_DAYS}); "
+            f"cost_usd in the call log may be stale — re-verify provider pricing.",
+            err=True,
+        )
+
+
 MAX_ATTEMPTS = 3
 BASE_DELAY_S = 2.0
 MAX_TOOL_TURNS = 5  # tool-executing rounds before the exchange is aborted
+
+# Anthropic prompt-cache rates relative to the input rate, 5m TTL (verified
+# against the installed SDK's cache_control shape and provider pricing docs
+# on 2026-07-13). Reads are ~10% of input price; writes carry a 25% premium.
+CACHE_WRITE_MULTIPLIER = 1.25
+CACHE_READ_MULTIPLIER = 0.10
+
+# Below the provider's minimum cacheable prefix a marker is a silent no-op;
+# skip marking small prompts entirely (gate resolutions, judge calls).
+MIN_CACHEABLE_TOKENS = 1024
+_CHARS_PER_TOKEN_ESTIMATE = 3  # conservative for code-heavy text
+
+
+def _cache_eligible(text: str) -> bool:
+    return len(text) >= MIN_CACHEABLE_TOKENS * _CHARS_PER_TOKEN_ESTIMATE
 
 
 @dataclass
@@ -70,6 +110,10 @@ class ProviderResponse:
     text: str
     input_tokens: int
     output_tokens: int
+    # None = not measured (providers without cache accounting); ints for
+    # Anthropic, including 0 (a cache write without a read stays visible).
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
 
 
 @dataclass
@@ -90,7 +134,8 @@ class CallRecord:
     """One log line per call attempt — the receipt (who, how much, how long).
 
     Failed attempts carry null tokens/cost: the SDK returns no usage on errors,
-    and an honest null beats an estimate.
+    and an honest null beats an estimate. Cache fields are null when the
+    provider doesn't report cache accounting (null = not measured, not zero).
     """
 
     timestamp: str
@@ -98,6 +143,8 @@ class CallRecord:
     model: str
     input_tokens: int | None
     output_tokens: int | None
+    cache_read_tokens: int | None
+    cache_write_tokens: int | None
     cost_usd: float | None
     latency_ms: int
     outcome: str  # "success" | "error:transient" | "error:fatal"
@@ -110,6 +157,17 @@ class Provider(Protocol):
     def complete(
         self, system: str, user_content: str, model_id: str, max_tokens: int, temperature: float
     ) -> ProviderResponse: ...
+
+
+def _response_from_message(message) -> ProviderResponse:
+    """Normalize a raw Anthropic message (text + usage incl. cache accounting)."""
+    return ProviderResponse(
+        text=next((b.text for b in message.content if b.type == "text"), ""),
+        input_tokens=message.usage.input_tokens,
+        output_tokens=message.usage.output_tokens,
+        cache_read_tokens=message.usage.cache_read_input_tokens or 0,
+        cache_write_tokens=message.usage.cache_creation_input_tokens or 0,
+    )
 
 
 class AnthropicProvider:
@@ -130,12 +188,37 @@ class AnthropicProvider:
         temperature: float,
         tools: list[ToolSpec] | None = None,
     ):
-        """Raw single API turn: full message history in, raw SDK message out."""
+        """Raw single API turn: full message history in, raw SDK message out.
+
+        Large system prompts and the first (large) user message are marked
+        with cache_control. The marking never changes prompt bytes — the text
+        is wrapped in a block, not rewritten (phase-05 parity holds).
+        """
+        system_param: Any = system
+        if _cache_eligible(system):
+            system_param = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+
+        if (
+            messages
+            and messages[0]["role"] == "user"
+            and isinstance(messages[0]["content"], str)
+            and _cache_eligible(messages[0]["content"])
+        ):
+            first = {
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": messages[0]["content"],
+                    "cache_control": {"type": "ephemeral"},
+                }],
+            }
+            messages = [first, *messages[1:]]
+
         kwargs: dict[str, Any] = dict(
             model=model_id,
             max_tokens=max_tokens,
             temperature=temperature,
-            system=system,
+            system=system_param,
             messages=messages,
         )
         if tools:
@@ -168,11 +251,7 @@ class AnthropicProvider:
         message = self.create_message(
             system, [{"role": "user", "content": user_content}], model_id, max_tokens, temperature
         )
-        return ProviderResponse(
-            text=message.content[0].text,
-            input_tokens=message.usage.input_tokens,
-            output_tokens=message.usage.output_tokens,
-        )
+        return _response_from_message(message)
 
 
 class OpenAIProvider:
@@ -241,12 +320,22 @@ def _append_record(record: CallRecord) -> None:
         fh.write(json.dumps(asdict(record)) + "\n")
 
 
-def _cost_usd(model_id: str, input_tokens: int, output_tokens: int) -> float | None:
+def _cost_usd(
+    model_id: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int | None = None,
+    cache_write_tokens: int | None = None,
+) -> float | None:
+    """input_tokens from the API excludes cached tokens; the pieces are disjoint."""
     rates = PRICING.get(model_id)
     if rates is None:
         return None
     input_rate, output_rate = rates
-    return round((input_tokens * input_rate + output_tokens * output_rate) / 1_000_000, 6)
+    total = input_tokens * input_rate + output_tokens * output_rate
+    total += (cache_write_tokens or 0) * input_rate * CACHE_WRITE_MULTIPLIER
+    total += (cache_read_tokens or 0) * input_rate * CACHE_READ_MULTIPLIER
+    return round(total / 1_000_000, 6)
 
 
 def _record(
@@ -264,7 +353,15 @@ def _record(
             model=model_id,
             input_tokens=response.input_tokens if response else None,
             output_tokens=response.output_tokens if response else None,
-            cost_usd=_cost_usd(model_id, response.input_tokens, response.output_tokens)
+            cache_read_tokens=response.cache_read_tokens if response else None,
+            cache_write_tokens=response.cache_write_tokens if response else None,
+            cost_usd=_cost_usd(
+                model_id,
+                response.input_tokens,
+                response.output_tokens,
+                response.cache_read_tokens,
+                response.cache_write_tokens,
+            )
             if response
             else None,
             latency_ms=int((time.monotonic() - started) * 1000),
@@ -324,17 +421,7 @@ def _create_message_with_retry(
         except FatalProviderError as e:
             _record(provider, model_id, started, "error:fatal", error=e)
             raise
-        _record(
-            provider,
-            model_id,
-            started,
-            "success",
-            response=ProviderResponse(
-                text="",
-                input_tokens=message.usage.input_tokens,
-                output_tokens=message.usage.output_tokens,
-            ),
-        )
+        _record(provider, model_id, started, "success", response=_response_from_message(message))
         return message
     raise AssertionError("unreachable")
 
@@ -362,12 +449,7 @@ def _run_tool_exchange(
         )
         last = message
         if message.stop_reason != "tool_use":
-            text = next((b.text for b in message.content if b.type == "text"), "")
-            return ProviderResponse(
-                text=text,
-                input_tokens=message.usage.input_tokens,
-                output_tokens=message.usage.output_tokens,
-            )
+            return _response_from_message(message)
         tool_uses = [b for b in message.content if b.type == "tool_use"]
         messages.append({"role": "assistant", "content": message.content})
         messages.append({
@@ -402,6 +484,7 @@ def complete(
     requires opening the call log. Callers stay ignorant of which provider SDK
     answered; failures surface as click.ClickException.
     """
+    _warn_if_pricing_stale()
     try:
         primary = AnthropicProvider()
     except FatalProviderError as e:
@@ -483,6 +566,7 @@ def complete_with_tools(
     fallback provider does not receive the tools — a tool-less review beats no
     review on the resilience path, and the post-review gate still runs.
     """
+    _warn_if_pricing_stale()
     try:
         primary = AnthropicProvider()
     except FatalProviderError as e:
