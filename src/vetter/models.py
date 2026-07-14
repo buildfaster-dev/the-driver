@@ -48,6 +48,7 @@ class ScanResult:
 
 @dataclass
 class PillarScore:
+    id: str  # stable lookup key, matches Pillar.id (e.g. "architecture_awareness")
     name: str
     score: int  # 1-5
     justification: str
@@ -56,10 +57,15 @@ class PillarScore:
 
 @dataclass
 class ReviewResult:
-    architecture_awareness: PillarScore
-    code_refinement: PillarScore
-    edge_case_coverage: PillarScore
+    pillar_scores: list[PillarScore]
     overall_summary: str
+
+    def pillar(self, pillar_id: str) -> PillarScore:
+        for ps in self.pillar_scores:
+            if ps.id == pillar_id:
+                return ps
+        raise KeyError(f"no pillar with id '{pillar_id}'")
+
 
 
 @dataclass

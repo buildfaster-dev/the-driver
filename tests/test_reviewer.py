@@ -64,15 +64,15 @@ def _make_scan(**overrides):
 class TestParseResponse:
     def test_valid_json(self):
         result = _parse_review_response(VALID_RESPONSE)
-        assert result.architecture_awareness.score == 4
-        assert result.code_refinement.score == 3
-        assert result.edge_case_coverage.score == 2
+        assert result.pillar("architecture_awareness").score == 4
+        assert result.pillar("code_refinement").score == 3
+        assert result.pillar("edge_case_coverage").score == 2
         assert "Decent submission" in result.overall_summary
 
     def test_json_in_code_block(self):
         wrapped = f"```json\n{VALID_RESPONSE}\n```"
         result = _parse_review_response(wrapped)
-        assert result.architecture_awareness.score == 4
+        assert result.pillar("architecture_awareness").score == 4
 
     def test_invalid_json(self):
         with pytest.raises(click.ClickException, match="Failed to parse"):
@@ -250,9 +250,9 @@ class TestReviewRepo:
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
             result = review_repo(_make_repo(), _make_scan())
 
-        assert result.architecture_awareness.score == 4
-        assert result.code_refinement.score == 3
-        assert result.edge_case_coverage.score == 2
+        assert result.pillar("architecture_awareness").score == 4
+        assert result.pillar("code_refinement").score == 3
+        assert result.pillar("edge_case_coverage").score == 2
 
     @patch("vetter.router.anthropic.Anthropic")
     def test_scan_tools_are_offered_to_the_model(self, mock_anthropic_class):
@@ -396,6 +396,6 @@ class TestParseResponseScoreClamping:
             "overall_summary": "test",
         })
         result = _parse_review_response(response)
-        assert result.architecture_awareness.score == 1
-        assert result.code_refinement.score == 5
-        assert result.edge_case_coverage.score == 4
+        assert result.pillar("architecture_awareness").score == 1
+        assert result.pillar("code_refinement").score == 5
+        assert result.pillar("edge_case_coverage").score == 4

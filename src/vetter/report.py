@@ -5,11 +5,7 @@ from vetter.models import RepoData, ScanResult, ReviewResult, Classification, Di
 
 
 def _classify(review_result: ReviewResult) -> Classification:
-    scores = [
-        review_result.architecture_awareness.score,
-        review_result.code_refinement.score,
-        review_result.edge_case_coverage.score,
-    ]
+    scores = [ps.score for ps in review_result.pillar_scores]
     avg = sum(scores) / len(scores)
 
     if avg >= 4:
