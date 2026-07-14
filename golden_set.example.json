@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "_readme": "Template for `vetter eval`. Copy this file to golden_set.json and edit it. The `path` fields below are PLACEHOLDERS — running this template unedited will fail on purpose: the harness checks that every specimen path exists and errors clearly if one does not. Label each specimen with the classification and recommendation YOU consider correct BEFORE running, so the evaluation measures Vetter against your standard rather than the other way around. Keys prefixed with '_' (like this one) are ignored by the loader; use them for notes.",
+  "specimens": [
+    {
+      "id": "a-repo-you-rate-highly",
+      "path": "/absolute/path/to/a/strong/repo",
+      "runs": 1,
+      "expected": {
+        "classification": "AI Orchestrator",
+        "recommendation": "Pass",
+        "pillar_ranges": {
+          "architecture_awareness": [4, 5],
+          "code_refinement": [3, 5],
+          "edge_case_coverage": [4, 5]
+        }
+      },
+      "_note": "Use an absolute path for external repos. pillar_ranges is optional: [low, high] inclusive per pillar id."
+    },
+    {
+      "id": "a-repo-you-would-reject",
+      "path": "/absolute/path/to/a/weak/repo",
+      "runs": 1,
+      "expected": {
+        "classification": "Copy-Paster",
+        "recommendation": "Reject"
+      },
+      "_note": "A golden set needs the low end too — a set of only strong repos cannot detect when Vetter becomes too lenient."
+    },
+    {
+      "id": "copy-paster-js",
+      "path": "fixtures/copy-paster-js",
+      "runs": 3,
+      "synthetic": true,
+      "expected": {
+        "classification": "Copy-Paster",
+        "recommendation": "Reject"
+      },
+      "_note": "A synthetic low-quality specimen shipped with Vetter. 'synthetic: true' builds its throwaway git history on demand. Relative paths resolve against this file's directory. Multiple runs (runs: 3) let the harness report per-pillar score spread across runs."
+    }
+  ]
+}
