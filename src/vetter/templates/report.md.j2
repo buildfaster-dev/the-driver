@@ -25,9 +25,9 @@
 
 | Pillar | Score | Justification |
 |--------|-------|---------------|
-| Architecture Awareness | {{ review_result.architecture_awareness.score }}/5 | {{ review_result.architecture_awareness.justification }} |
-| Code Refinement | {{ review_result.code_refinement.score }}/5 | {{ review_result.code_refinement.justification }} |
-| Edge Case Coverage | {{ review_result.edge_case_coverage.score }}/5 | {{ review_result.edge_case_coverage.justification }} |
+{% for ps in review_result.pillar_scores -%}
+| {{ ps.name }} | {{ ps.score }}/5 | {{ ps.justification }} |
+{% endfor %}
 
 ---
 
@@ -72,33 +72,16 @@ None detected — the automated scan and the AI review are consistent.
 ---
 
 ## Evidence
-
-### Architecture Awareness
-{% if review_result.architecture_awareness.evidence -%}
-{% for e in review_result.architecture_awareness.evidence -%}
+{% for ps in review_result.pillar_scores %}
+### {{ ps.name }}
+{% if ps.evidence -%}
+{% for e in ps.evidence -%}
 - `{{ e }}`
 {% endfor %}
 {% else -%}
 No specific evidence cited.
 {% endif %}
-
-### Code Refinement
-{% if review_result.code_refinement.evidence -%}
-{% for e in review_result.code_refinement.evidence -%}
-- `{{ e }}`
 {% endfor %}
-{% else -%}
-No specific evidence cited.
-{% endif %}
-
-### Edge Case Coverage
-{% if review_result.edge_case_coverage.evidence -%}
-{% for e in review_result.edge_case_coverage.evidence -%}
-- `{{ e }}`
-{% endfor %}
-{% else -%}
-No specific evidence cited.
-{% endif %}
 
 ---
 

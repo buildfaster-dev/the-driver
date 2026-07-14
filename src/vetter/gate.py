@@ -32,26 +32,21 @@ Respond ONLY with valid JSON: one object mapping each rule id to its resolution 
 def _pillar_texts(review: ReviewResult) -> dict[str, str]:
     return {
         pillar.name: " ".join([pillar.justification, *pillar.evidence])
-        for pillar in (
-            review.architecture_awareness,
-            review.code_refinement,
-            review.edge_case_coverage,
-        )
+        for pillar in review.pillar_scores
     }
 
 
 def detect_discrepancies(scan: ScanResult, review: ReviewResult) -> list[Discrepancy]:
     """Pure rule evaluation over dataclass fields. No I/O, no model."""
     discrepancies: list[Discrepancy] = []
+    edge = review.pillar("edge_case_coverage")
+    refinement = review.pillar("code_refinement")
 
-    if scan.error_handling == "minimal" and review.edge_case_coverage.score >= STRONG_SCORE:
+    if scan.error_handling == "minimal" and edge.score >= STRONG_SCORE:
         discrepancies.append(Discrepancy(
             rule="error-handling-conflict",
             scan_says="error handling pattern MINIMAL — critical paths may be unprotected",
-            review_says=(
-                f"Edge Case Coverage {review.edge_case_coverage.score}/5: "
-                f"{review.edge_case_coverage.justification}"
-            ),
+            review_says=f"{edge.name} {edge.score}/5: {edge.justification}",
         ))
 
     lint_mentions = [
@@ -66,19 +61,19 @@ def detect_discrepancies(scan: ScanResult, review: ReviewResult) -> list[Discrep
             review_says="the review discusses linting — " + " | ".join(lint_mentions),
         ))
 
-    if not scan.dependencies and review.code_refinement.score >= STRONG_SCORE:
+    if not scan.dependencies and refinement.score >= STRONG_SCORE:
         discrepancies.append(Discrepancy(
             rule="dependencies-conflict",
             scan_says="no dependency manifest detected",
             review_says=(
-                f"Code Refinement {review.code_refinement.score}/5 (a pillar that "
-                f"includes library choices): {review.code_refinement.justification}"
+                f"{refinement.name} {refinement.score}/5 (a pillar that "
+                f"includes library choices): {refinement.justification}"
             ),
         ))
 
     if (
         len(scan.security_flags) >= SECURITY_FLAGS_THRESHOLD
-        and review.edge_case_coverage.score >= STRONG_SCORE
+        and edge.score >= STRONG_SCORE
     ):
         discrepancies.append(Discrepancy(
             rule="security-flags-unaddressed",
@@ -88,8 +83,8 @@ def detect_discrepancies(scan: ScanResult, review: ReviewResult) -> list[Discrep
                 + ("; ..." if len(scan.security_flags) > 5 else "")
             ),
             review_says=(
-                f"Edge Case Coverage {review.edge_case_coverage.score}/5 (a pillar that "
-                f"includes security considerations): {review.edge_case_coverage.justification}"
+                f"{edge.name} {edge.score}/5 (a pillar that "
+                f"includes security considerations): {edge.justification}"
             ),
         ))
 

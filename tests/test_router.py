@@ -469,8 +469,8 @@ class TestPipelineFallback:
         with patch.dict("os.environ", BOTH_KEYS):
             result = review_repo(repo, scan, model="sonnet")
 
-        assert result.architecture_awareness.score == 4
-        assert result.edge_case_coverage.score == 2
+        assert result.pillar("architecture_awareness").score == 4
+        assert result.pillar("edge_case_coverage").score == 2
         assert mock_anthropic.return_value.messages.create.call_count == MAX_ATTEMPTS
         assert mock_openai.return_value.chat.completions.create.call_count == 1
 

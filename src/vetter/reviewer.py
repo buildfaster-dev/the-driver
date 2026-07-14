@@ -6,56 +6,12 @@ from pathlib import PurePosixPath
 import click
 from vetter import router
 from vetter.models import FileInfo, RepoData, ReviewResult, PillarScore, ScanResult
+from vetter.pillars import PILLARS, Pillar, build_system_prompt
 
 
-SYSTEM_PROMPT = """You are a Staff Software Engineer conducting a code review of a candidate's technical test submission.
-
-Evaluate the codebase across three pillars, scoring each from 1 to 5:
-
-## Pillar 1: Architecture Awareness (1-5)
-Evaluate project structure, separation of concerns, design patterns, naming conventions, and appropriate use of abstractions.
-- 1: No structure, everything in one file, no patterns
-- 2: Minimal structure, poor separation, inconsistent naming
-- 3: Basic structure present, some patterns, acceptable naming
-- 4: Well-organized, clear separation, good patterns, consistent naming
-- 5: Excellent architecture, strong design patterns, clean abstractions
-
-## Pillar 2: Code Refinement (1-5)
-Evaluate code cleanliness, idiomatic usage, absence of unnecessary boilerplate, and appropriate library choices.
-- 1: Raw AI-generated boilerplate, no cleanup, poor idioms
-- 2: Mostly boilerplate, some cleanup, inconsistent style
-- 3: Reasonable code, some boilerplate remains, acceptable idioms
-- 4: Clean code, idiomatic, good library choices, minimal boilerplate
-- 5: Highly refined, excellent idioms, thoughtful library usage
-
-## Pillar 3: Edge Case Coverage (1-5)
-Evaluate input validation, error handling, test coverage of boundary conditions, and security considerations.
-- 1: No error handling, no tests, no input validation
-- 2: Minimal error handling, few tests, basic validation
-- 3: Some error handling, tests for happy path, basic validation
-- 4: Good error handling, tests include edge cases, proper validation
-- 5: Comprehensive error handling, thorough edge case testing, security-aware
-
-## Response Format
-Respond ONLY with valid JSON in this exact format:
-{
-  "architecture_awareness": {
-    "score": <1-5>,
-    "justification": "<2-3 sentences explaining the score>",
-    "evidence": ["<file:line — specific code reference>", "..."]
-  },
-  "code_refinement": {
-    "score": <1-5>,
-    "justification": "<2-3 sentences explaining the score>",
-    "evidence": ["<file:line — specific code reference>", "..."]
-  },
-  "edge_case_coverage": {
-    "score": <1-5>,
-    "justification": "<2-3 sentences explaining the score>",
-    "evidence": ["<file:line — specific code reference>", "..."]
-  },
-  "overall_summary": "<3-5 sentence overall assessment of the candidate's engineering quality>"
-}"""
+# Generated from the pillar definitions; byte-parity with the original
+# hand-written prompt is enforced by tests/test_pillars.py.
+SYSTEM_PROMPT = build_system_prompt(PILLARS)
 
 
 CONTEXT_CHAR_BUDGET = 400_000
@@ -191,7 +147,8 @@ def _clamp_score(value) -> int:
     return max(1, min(5, score))
 
 
-def _parse_review_response(response_text: str) -> ReviewResult:
+def _parse_review_response(response_text: str, pillars: list[Pillar] | None = None) -> ReviewResult:
+    pillars = pillars if pillars is not None else PILLARS
     text = response_text.strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1]
@@ -207,25 +164,18 @@ def _parse_review_response(response_text: str) -> ReviewResult:
         )
 
     try:
+        pillar_scores = [
+            PillarScore(
+                id=pillar.id,
+                name=pillar.name,
+                score=_clamp_score(data[pillar.id]["score"]),
+                justification=data[pillar.id]["justification"],
+                evidence=data[pillar.id].get("evidence", []),
+            )
+            for pillar in pillars
+        ]
         return ReviewResult(
-            architecture_awareness=PillarScore(
-                name="Architecture Awareness",
-                score=_clamp_score(data["architecture_awareness"]["score"]),
-                justification=data["architecture_awareness"]["justification"],
-                evidence=data["architecture_awareness"].get("evidence", []),
-            ),
-            code_refinement=PillarScore(
-                name="Code Refinement",
-                score=_clamp_score(data["code_refinement"]["score"]),
-                justification=data["code_refinement"]["justification"],
-                evidence=data["code_refinement"].get("evidence", []),
-            ),
-            edge_case_coverage=PillarScore(
-                name="Edge Case Coverage",
-                score=_clamp_score(data["edge_case_coverage"]["score"]),
-                justification=data["edge_case_coverage"]["justification"],
-                evidence=data["edge_case_coverage"].get("evidence", []),
-            ),
+            pillar_scores=pillar_scores,
             overall_summary=data["overall_summary"],
         )
     except KeyError as e:
@@ -237,8 +187,7 @@ def _parse_review_response(response_text: str) -> ReviewResult:
 
 def _validate_review_result(result: ReviewResult, raw_response: str) -> None:
     """Reject deliveries with empty justification/evidence — delivery contract, not judgment."""
-    pillars = (result.architecture_awareness, result.code_refinement, result.edge_case_coverage)
-    for pillar in pillars:
+    for pillar in result.pillar_scores:
         if not pillar.justification.strip():
             raise click.ClickException(
                 f"AI review has an empty justification for pillar '{pillar.name}'.\n"

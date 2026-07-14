@@ -38,9 +38,11 @@ def _scan(**overrides):
 def _review(arch=5, refine=5, edge=5, arch_just="Clean layering.",
             refine_just="Idiomatic code.", edge_just="Comprehensive handling."):
     return ReviewResult(
-        architecture_awareness=PillarScore("Architecture Awareness", arch, arch_just, []),
-        code_refinement=PillarScore("Code Refinement", refine, refine_just, []),
-        edge_case_coverage=PillarScore("Edge Case Coverage", edge, edge_just, []),
+        pillar_scores=[
+            PillarScore("architecture_awareness", "Architecture Awareness", arch, arch_just, []),
+            PillarScore("code_refinement", "Code Refinement", refine, refine_just, []),
+            PillarScore("edge_case_coverage", "Edge Case Coverage", edge, edge_just, []),
+        ],
         overall_summary="Overall strong.",
     )
 

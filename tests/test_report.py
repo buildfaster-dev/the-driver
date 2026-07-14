@@ -7,9 +7,11 @@ from vetter.report import generate_report, _classify
 
 def _make_review(arch=4, refine=4, edge=4):
     return ReviewResult(
-        architecture_awareness=PillarScore("Architecture Awareness", arch, "Good architecture.", []),
-        code_refinement=PillarScore("Code Refinement", refine, "Clean code.", []),
-        edge_case_coverage=PillarScore("Edge Case Coverage", edge, "Good coverage.", []),
+        pillar_scores=[
+            PillarScore("architecture_awareness", "Architecture Awareness", arch, "Good architecture.", []),
+            PillarScore("code_refinement", "Code Refinement", refine, "Clean code.", []),
+            PillarScore("edge_case_coverage", "Edge Case Coverage", edge, "Good coverage.", []),
+        ],
         overall_summary="Solid submission overall.",
     )
 
