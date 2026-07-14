@@ -7,3 +7,5 @@ dist/
 .claude/
 report.md
 .vetter/
+eval-results/
+fixtures/copy-paster-js/log.txt
