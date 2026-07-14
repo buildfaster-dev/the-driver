@@ -19,10 +19,10 @@ import json
 import os
 import random
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Callable, Protocol
 
 import anthropic
 import click
@@ -62,6 +62,7 @@ PRICING = {
 
 MAX_ATTEMPTS = 3
 BASE_DELAY_S = 2.0
+MAX_TOOL_TURNS = 5  # tool-executing rounds before the exchange is aborted
 
 
 @dataclass
@@ -69,6 +70,19 @@ class ProviderResponse:
     text: str
     input_tokens: int
     output_tokens: int
+
+
+@dataclass
+class ToolSpec:
+    """Provider-neutral tool declaration; each provider maps it to its wire format."""
+
+    name: str
+    description: str
+    input_schema: dict[str, Any] = field(default_factory=lambda: {"type": "object", "properties": {}})
+
+
+# A tool handler executes one tool call: (tool_name, tool_input) -> result string.
+ToolHandler = Callable[[str, dict[str, Any]], str]
 
 
 @dataclass
@@ -107,17 +121,30 @@ class AnthropicProvider:
             raise FatalProviderError("ANTHROPIC_API_KEY environment variable is not set.")
         self._client = anthropic.Anthropic(api_key=api_key)
 
-    def complete(
-        self, system: str, user_content: str, model_id: str, max_tokens: int, temperature: float
-    ) -> ProviderResponse:
+    def create_message(
+        self,
+        system: str,
+        messages: list[dict],
+        model_id: str,
+        max_tokens: int,
+        temperature: float,
+        tools: list[ToolSpec] | None = None,
+    ):
+        """Raw single API turn: full message history in, raw SDK message out."""
+        kwargs: dict[str, Any] = dict(
+            model=model_id,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system=system,
+            messages=messages,
+        )
+        if tools:
+            kwargs["tools"] = [
+                {"name": t.name, "description": t.description, "input_schema": t.input_schema}
+                for t in tools
+            ]
         try:
-            message = self._client.messages.create(
-                model=model_id,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                system=system,
-                messages=[{"role": "user", "content": user_content}],
-            )
+            return self._client.messages.create(**kwargs)
         except anthropic.AuthenticationError:
             raise FatalProviderError("anthropic: invalid ANTHROPIC_API_KEY. Please check your API key.")
         except anthropic.PermissionDeniedError as e:
@@ -134,6 +161,13 @@ class AnthropicProvider:
             raise FatalProviderError(f"anthropic: {e}")
         except anthropic.APIConnectionError as e:  # includes APITimeoutError
             raise TransientProviderError(f"anthropic: {e}")
+
+    def complete(
+        self, system: str, user_content: str, model_id: str, max_tokens: int, temperature: float
+    ) -> ProviderResponse:
+        message = self.create_message(
+            system, [{"role": "user", "content": user_content}], model_id, max_tokens, temperature
+        )
         return ProviderResponse(
             text=message.content[0].text,
             input_tokens=message.usage.input_tokens,
@@ -267,6 +301,92 @@ def _call_with_retry(
     raise AssertionError("unreachable")
 
 
+def _create_message_with_retry(
+    provider: AnthropicProvider,
+    system: str,
+    messages: list[dict],
+    model_id: str,
+    max_tokens: int,
+    temperature: float,
+    tools: list[ToolSpec],
+):
+    """One tool-exchange turn with the same retry/backoff and per-call logging."""
+    for attempt in range(MAX_ATTEMPTS):
+        started = time.monotonic()
+        try:
+            message = provider.create_message(system, messages, model_id, max_tokens, temperature, tools)
+        except TransientProviderError as e:
+            _record(provider, model_id, started, "error:transient", error=e)
+            if attempt < MAX_ATTEMPTS - 1:
+                time.sleep(BASE_DELAY_S * (2**attempt) + random.uniform(0, 1))
+                continue
+            raise
+        except FatalProviderError as e:
+            _record(provider, model_id, started, "error:fatal", error=e)
+            raise
+        _record(
+            provider,
+            model_id,
+            started,
+            "success",
+            response=ProviderResponse(
+                text="",
+                input_tokens=message.usage.input_tokens,
+                output_tokens=message.usage.output_tokens,
+            ),
+        )
+        return message
+    raise AssertionError("unreachable")
+
+
+def _run_tool_exchange(
+    provider: AnthropicProvider,
+    system: str,
+    user_content: str,
+    model_id: str,
+    max_tokens: int,
+    temperature: float,
+    tools: list[ToolSpec],
+    tool_handler: ToolHandler,
+) -> ProviderResponse:
+    """Drive the tool_use loop until the model stops calling tools.
+
+    Anthropic-only by design: the fallback provider runs tool-less (declared
+    degradation — resilience path delivers a review, not tool parity).
+    """
+    messages: list[dict] = [{"role": "user", "content": user_content}]
+    last = None
+    for _turn in range(MAX_TOOL_TURNS + 1):
+        message = _create_message_with_retry(
+            provider, system, messages, model_id, max_tokens, temperature, tools
+        )
+        last = message
+        if message.stop_reason != "tool_use":
+            text = next((b.text for b in message.content if b.type == "text"), "")
+            return ProviderResponse(
+                text=text,
+                input_tokens=message.usage.input_tokens,
+                output_tokens=message.usage.output_tokens,
+            )
+        tool_uses = [b for b in message.content if b.type == "tool_use"]
+        messages.append({"role": "assistant", "content": message.content})
+        messages.append({
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": tool_handler(block.name, block.input),
+                }
+                for block in tool_uses
+            ],
+        })
+    raise FatalProviderError(
+        f"anthropic: tool exchange still requesting tools after {MAX_TOOL_TURNS} rounds "
+        f"(last stop_reason: {last.stop_reason})"
+    )
+
+
 def complete(
     system: str,
     user_content: str,
@@ -295,7 +415,22 @@ def complete(
     except TransientProviderError as e:
         primary_error = e
 
-    # Primary exhausted its retries on transient errors only — climb the ladder.
+    return _fallback_completion(
+        system, user_content, model, max_tokens, temperature, primary_model, primary_error
+    )
+
+
+def _fallback_completion(
+    system: str,
+    user_content: str,
+    model: str,
+    max_tokens: int,
+    temperature: float,
+    primary_model: str,
+    primary_error: TransientProviderError,
+    tools_degraded: bool = False,
+) -> str:
+    """Climb the ladder: primary exhausted its retries on transient errors only."""
     try:
         fallback = OpenAIProvider()
     except FatalProviderError as e:
@@ -304,9 +439,14 @@ def complete(
             f"({primary_error}) and fallback is not available: {e}"
         )
     fallback_model = _resolve_model(model, fallback.name)
+    degradation = (
+        " Scan tools are not supported on the fallback provider; the review proceeds without scan tools."
+        if tools_degraded
+        else ""
+    )
     click.echo(
         f"Warning: anthropic ({primary_model}) unavailable after {MAX_ATTEMPTS} attempts; "
-        f"falling back to openai ({fallback_model}).",
+        f"falling back to openai ({fallback_model}).{degradation}",
         err=True,
     )
     try:
@@ -326,3 +466,39 @@ def complete(
         err=True,
     )
     return response.text
+
+
+def complete_with_tools(
+    system: str,
+    user_content: str,
+    tools: list[ToolSpec],
+    tool_handler: ToolHandler,
+    model: str = "sonnet",
+    max_tokens: int = 4096,
+    temperature: float = 0.0,
+) -> str:
+    """Route a completion that may invoke tools mid-exchange.
+
+    Same resilience ladder as complete(), with one declared degradation: the
+    fallback provider does not receive the tools — a tool-less review beats no
+    review on the resilience path, and the post-review gate still runs.
+    """
+    try:
+        primary = AnthropicProvider()
+    except FatalProviderError as e:
+        raise click.ClickException(str(e))
+    primary_model = _resolve_model(model, primary.name)
+
+    try:
+        return _run_tool_exchange(
+            primary, system, user_content, primary_model, max_tokens, temperature, tools, tool_handler
+        ).text
+    except FatalProviderError as e:
+        raise click.ClickException(str(e))
+    except TransientProviderError as e:
+        primary_error = e
+
+    return _fallback_completion(
+        system, user_content, model, max_tokens, temperature, primary_model, primary_error,
+        tools_degraded=True,
+    )

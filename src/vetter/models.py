@@ -63,6 +63,16 @@ class ReviewResult:
 
 
 @dataclass
+class Discrepancy:
+    """A scan-vs-review contradiction caught by the gate, plus its resolution."""
+
+    rule: str  # machine id of the gate rule that fired
+    scan_says: str
+    review_says: str
+    resolution: str | None = None  # reviewer's explicit resolution (second call)
+
+
+@dataclass
 class Classification:
     label: str  # "Copy-Paster" / "Assisted Engineer" / "AI Orchestrator"
     recommendation: str  # "Pass" / "Review Further" / "Reject"

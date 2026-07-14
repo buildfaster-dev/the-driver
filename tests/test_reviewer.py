@@ -2,7 +2,7 @@ import json
 import pytest
 import click
 from unittest.mock import patch, MagicMock
-from vetter.models import RepoData, FileInfo
+from vetter.models import RepoData, FileInfo, ScanResult
 from vetter.reviewer import (
     review_repo,
     _parse_review_response,
@@ -42,6 +42,23 @@ def _make_repo():
         total_files=1,
         total_lines=1,
     )
+
+
+def _make_scan(**overrides):
+    defaults = dict(
+        test_ratio=0.0,
+        has_linter_config=False,
+        linter_configs_found=[],
+        commit_count=3,
+        commit_quality="poor",
+        commit_messages=["init", "wip", "fix"],
+        dependencies=[],
+        error_handling="minimal",
+        security_flags=["config.py: potential hardcoded secret detected"],
+        languages={"Python": 1},
+    )
+    defaults.update(overrides)
+    return ScanResult(**defaults)
 
 
 class TestParseResponse:
@@ -192,28 +209,124 @@ class TestContextSelection:
         )
 
 
+def _final_review_message(text=VALID_RESPONSE):
+    block = MagicMock()
+    block.type = "text"
+    block.text = text
+    msg = MagicMock()
+    msg.stop_reason = "end_turn"
+    msg.content = [block]
+    msg.usage.input_tokens = 1000
+    msg.usage.output_tokens = 200
+    return msg
+
+
+def _tool_call_message(name, tool_id="tu_1"):
+    block = MagicMock()
+    block.type = "tool_use"
+    block.id = tool_id
+    block.name = name
+    block.input = {}
+    msg = MagicMock()
+    msg.stop_reason = "tool_use"
+    msg.content = [block]
+    msg.usage.input_tokens = 1000
+    msg.usage.output_tokens = 50
+    return msg
+
+
 class TestReviewRepo:
     def test_missing_api_key(self):
         with patch.dict("os.environ", {}, clear=True):
             with pytest.raises(click.ClickException, match="ANTHROPIC_API_KEY"):
-                review_repo(_make_repo())
+                review_repo(_make_repo(), _make_scan())
 
     @patch("vetter.router.anthropic.Anthropic")
     def test_successful_review(self, mock_anthropic_class):
         mock_client = MagicMock()
         mock_anthropic_class.return_value = mock_client
-        mock_message = MagicMock()
-        mock_message.content = [MagicMock(text=VALID_RESPONSE)]
-        mock_message.usage.input_tokens = 1000
-        mock_message.usage.output_tokens = 200
-        mock_client.messages.create.return_value = mock_message
+        mock_client.messages.create.return_value = _final_review_message()
 
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
-            result = review_repo(_make_repo())
+            result = review_repo(_make_repo(), _make_scan())
 
         assert result.architecture_awareness.score == 4
         assert result.code_refinement.score == 3
         assert result.edge_case_coverage.score == 2
+
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_scan_tools_are_offered_to_the_model(self, mock_anthropic_class):
+        mock_client = MagicMock()
+        mock_anthropic_class.return_value = mock_client
+        mock_client.messages.create.return_value = _final_review_message()
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            review_repo(_make_repo(), _make_scan())
+
+        offered = mock_client.messages.create.call_args.kwargs["tools"]
+        assert {t["name"] for t in offered} == {
+            "get_scan_summary", "get_security_flags", "get_test_metrics",
+        }
+
+    @patch("vetter.router.anthropic.Anthropic")
+    def test_tool_result_is_the_real_scan_not_an_invention(self, mock_anthropic_class):
+        # Eval 1 anti-invention clause: the payload the model receives must be
+        # byte-derived from the real ScanResult.
+        scan = _make_scan(security_flags=[
+            "config/runtime.exs: potential hardcoded secret detected",
+            "k8s/secret.yaml: potential hardcoded secret detected",
+        ])
+        mock_client = MagicMock()
+        mock_anthropic_class.return_value = mock_client
+        mock_client.messages.create.side_effect = [
+            _tool_call_message("get_security_flags", tool_id="tu_9"),
+            _final_review_message(),
+        ]
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+            review_repo(_make_repo(), scan)
+
+        second_messages = mock_client.messages.create.call_args_list[1].kwargs["messages"]
+        tool_result = second_messages[2]["content"][0]
+        assert tool_result["tool_use_id"] == "tu_9"
+        assert json.loads(tool_result["content"]) == {"security_flags": scan.security_flags}
+
+
+class TestScanToolHandler:
+    def test_scan_summary_matches_dataclass_fields(self):
+        from vetter.reviewer import _scan_tool_handler
+        scan = _make_scan(error_handling="strategic", dependencies=["pip: requirements.txt"])
+        handler = _scan_tool_handler(scan, _make_repo())
+
+        data = json.loads(handler("get_scan_summary", {}))
+
+        assert data["error_handling"] == "strategic"
+        assert data["dependencies"] == ["pip: requirements.txt"]
+        assert data["test_ratio"] == scan.test_ratio
+        assert data["has_linter_config"] == scan.has_linter_config
+        assert "security_flags" not in data  # has its own tool
+
+    def test_test_metrics_counts_real_files(self):
+        from vetter.reviewer import _scan_tool_handler
+        repo = RepoData(
+            path="/fake",
+            files=[
+                FileInfo("app.py", "x", "Python", 1, False),
+                FileInfo("notes.md", "x", "Markdown", 1, False),
+                FileInfo("test_app.py", "x", "Python", 1, True),
+            ],
+            commits=[], languages={"Python": 2}, total_files=3, total_lines=3,
+        )
+        handler = _scan_tool_handler(_make_scan(test_ratio=1.0), repo)
+
+        data = json.loads(handler("get_test_metrics", {}))
+
+        assert data == {"test_ratio": 1.0, "source_file_count": 1, "test_file_count": 1}
+
+    def test_unknown_tool_returns_error_payload(self):
+        from vetter.reviewer import _scan_tool_handler
+        handler = _scan_tool_handler(_make_scan(), _make_repo())
+        assert "unknown tool" in json.loads(handler("get_weather", {}))["error"]
 
 
 class TestValidateReviewResult:

@@ -5,6 +5,7 @@ from rich.console import Console
 from vetter.ingester import ingest_repo
 from vetter.scanner import scan_repo
 from vetter.reviewer import review_repo
+from vetter.gate import detect_discrepancies, resolve_discrepancies
 from vetter.report import generate_report
 
 console = Console()
@@ -41,9 +42,19 @@ def analyze(repo_path: str, candidate: str | None, repo_url: str | None, output:
         console.print("[green]✓[/green] Automated scan complete")
 
         with console.status("[bold green]Running AI expert review..."):
-            review_result = review_repo(repo_data, model=model)
+            review_result = review_repo(repo_data, scan_result, model=model)
 
         console.print("[green]✓[/green] AI review complete")
+
+        with console.status("[bold green]Confronting scan vs review..."):
+            discrepancies = detect_discrepancies(scan_result, review_result)
+            if discrepancies:
+                discrepancies = resolve_discrepancies(discrepancies, model=model)
+
+        if discrepancies:
+            console.print(f"[yellow]![/yellow] Gate: {len(discrepancies)} discrepancies confronted and resolved")
+        else:
+            console.print("[green]✓[/green] Gate: scan and review are consistent")
 
         with console.status("[bold green]Generating report..."):
             report = generate_report(
@@ -52,6 +63,7 @@ def analyze(repo_path: str, candidate: str | None, repo_url: str | None, output:
                 review_result=review_result,
                 candidate=candidate,
                 repo_url=repo_url,
+                discrepancies=discrepancies,
             )
 
         with open(output, "w") as f:
