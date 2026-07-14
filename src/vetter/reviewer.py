@@ -1,16 +1,8 @@
 import json
-import os
-import time
 import click
-import anthropic
+from vetter import router
 from vetter.models import RepoData, ReviewResult, PillarScore
 
-
-MODEL_MAP = {
-    "sonnet": "claude-sonnet-4-6",
-    "opus": "claude-opus-4-6",
-    "haiku": "claude-haiku-4-5-20251001",
-}
 
 SYSTEM_PROMPT = """You are a Staff Software Engineer conducting a code review of a candidate's technical test submission.
 
@@ -160,37 +152,33 @@ def _parse_review_response(response_text: str) -> ReviewResult:
         )
 
 
-def review_repo(repo_data: RepoData, model: str = "sonnet") -> ReviewResult:
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise click.ClickException("ANTHROPIC_API_KEY environment variable is not set.")
-
-    model_id = MODEL_MAP.get(model, model)
-    client = anthropic.Anthropic(api_key=api_key)
-    context = _build_codebase_context(repo_data)
-
-    max_attempts = 2
-    for attempt in range(max_attempts):
-        try:
-            message = client.messages.create(
-                model=model_id,
-                max_tokens=4096,
-                temperature=0,
-                system=SYSTEM_PROMPT,
-                messages=[
-                    {"role": "user", "content": f"Review this candidate's technical test submission:\n\n{context}"}
-                ],
+def _validate_review_result(result: ReviewResult, raw_response: str) -> None:
+    """Reject deliveries with empty justification/evidence — delivery contract, not judgment."""
+    pillars = (result.architecture_awareness, result.code_refinement, result.edge_case_coverage)
+    for pillar in pillars:
+        if not pillar.justification.strip():
+            raise click.ClickException(
+                f"AI review has an empty justification for pillar '{pillar.name}'.\n"
+                f"Raw response:\n{raw_response[:500]}"
             )
-            break
-        except anthropic.AuthenticationError:
-            raise click.ClickException("Invalid ANTHROPIC_API_KEY. Please check your API key.")
-        except anthropic.RateLimitError:
-            if attempt < max_attempts - 1:
-                time.sleep(5)
-                continue
-            raise click.ClickException("Anthropic API rate limit reached. Please wait and try again.")
-        except anthropic.APIError as e:
-            raise click.ClickException(f"Anthropic API error: {e}")
+        if not [e for e in pillar.evidence if e.strip()]:
+            raise click.ClickException(
+                f"AI review has no evidence for pillar '{pillar.name}'.\n"
+                f"Raw response:\n{raw_response[:500]}"
+            )
+    if not result.overall_summary.strip():
+        raise click.ClickException(
+            f"AI review has an empty overall_summary.\nRaw response:\n{raw_response[:500]}"
+        )
 
-    response_text = message.content[0].text
-    return _parse_review_response(response_text)
+
+def review_repo(repo_data: RepoData, model: str = "sonnet") -> ReviewResult:
+    context = _build_codebase_context(repo_data)
+    response_text = router.complete(
+        system=SYSTEM_PROMPT,
+        user_content=f"Review this candidate's technical test submission:\n\n{context}",
+        model=model,
+    )
+    result = _parse_review_response(response_text)
+    _validate_review_result(result, response_text)
+    return result
